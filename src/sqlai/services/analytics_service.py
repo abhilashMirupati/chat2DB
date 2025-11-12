@@ -4,8 +4,10 @@ High level service for answering natural language questions about databases.
 
 from __future__ import annotations
 
-import json
 import hashlib
+import json
+import threading
+from concurrent.futures import ThreadPoolExecutor, as_completed
 from dataclasses import replace
 from typing import Any, Dict, List, Optional, Sequence
 
@@ -28,7 +30,12 @@ from sqlai.config import (
     load_llm_config,
 )
 from sqlai.database.connectors import build_sql_database, create_db_engine, test_connection
-from sqlai.database.schema_introspector import ForeignKeyDetail, introspect_database
+from sqlai.database.schema_introspector import (
+    ForeignKeyDetail,
+    TableSummary,
+    introspect_database,
+    _format_fk_detail,
+)
 from sqlai.graph.context import GraphContext, TableCard, build_graph_context
 from sqlai.semantic.retriever import RetrievalResult, SemanticRetriever
 from sqlai.llm.providers import LLMProviderError, load_chat_model
@@ -71,6 +78,8 @@ class AnalyticsService:
             self.llm = load_chat_model(self.llm_config)
         except LLMProviderError as exc:
             raise RuntimeError(f"Failed to load LLM provider: {exc}") from exc
+
+        self._llm_lock = threading.Lock()
 
         self.schema_summaries = introspect_database(
             self.engine,
@@ -283,38 +292,108 @@ class AnalyticsService:
 
     def _hydrate_table_metadata(self) -> None:
         schema_key = self._schema_key()
-        updated_summaries = []
-        self.table_hashes = {}
-        for summary in self.schema_summaries:
-            schema_hash = self._table_schema_hash(summary)
-            self.table_hashes[summary.name] = schema_hash
-            cached = self.metadata_cache.fetch(schema_key, summary.name)
-            samples: Dict[str, List[str]] = {}
-            description: Optional[str] = None
-            if cached and cached.get("schema_hash") == schema_hash:
-                samples = cached.get("samples") or {}
-                description = cached.get("description")
-                if not samples:
-                    samples = self._collect_column_samples(summary)
-                if not description:
-                    description = self._generate_table_description(summary)
-                self.metadata_cache.upsert(schema_key, summary.name, schema_hash, description, samples)
-            else:
-                description = self._generate_table_description(summary)
-                samples = self._collect_column_samples(summary)
-                self.metadata_cache.upsert(schema_key, summary.name, schema_hash, description, samples)
-            columns = [
-                replace(column, sample_values=samples.get(column.name))
-                for column in summary.columns
-            ]
-            updated_summaries.append(
-                replace(
-                    summary,
-                    columns=columns,
-                    description=description,
+        summaries = self.schema_summaries
+        total_tables = len(summaries)
+        if total_tables == 0:
+            LOGGER.info("No tables detected during metadata hydration.")
+            return
+
+        LOGGER.info(
+            "Hydrating metadata for %s tables in schema '%s'.",
+            total_tables,
+            schema_key or "(default)",
+        )
+
+        self.table_hashes = {summary.name: self._table_schema_hash(summary) for summary in summaries}
+
+        def process_summary(summary: TableSummary) -> TableSummary:
+            table_name = summary.name
+            schema_hash = self.table_hashes[table_name]
+            LOGGER.debug("Starting metadata hydration for table '%s'", table_name)
+            try:
+                cached = self.metadata_cache.fetch(schema_key, table_name)
+                cached_hash = cached.get("schema_hash") if cached else None
+                cache_hit = bool(cached and cached_hash == schema_hash)
+                LOGGER.debug(
+                    "Cache lookup for '%s': hit=%s cached_hash=%s current_hash=%s",
+                    table_name,
+                    cache_hit,
+                    cached_hash,
+                    schema_hash,
                 )
+                if cache_hit and cached:
+                    samples: Dict[str, List[str]] = cached.get("samples") or {}
+                    description: Optional[str] = cached.get("description")
+                else:
+                    samples = {}
+                    description = None
+
+                if not description:
+                    LOGGER.debug("Generating description for table '%s'", table_name)
+                    description = self._generate_table_description(summary)
+                else:
+                    LOGGER.debug("Reusing cached description for table '%s'", table_name)
+
+                if not samples:
+                    LOGGER.debug(
+                        "Collecting column samples for table '%s' (%s columns)",
+                        table_name,
+                        len(summary.columns),
+                    )
+                    samples = self._collect_column_samples(summary)
+                    LOGGER.debug(
+                        "Collected samples for table '%s': %s",
+                        table_name,
+                        ", ".join(samples.keys()) or "<none>",
+                    )
+                else:
+                    LOGGER.debug("Reusing cached samples for table '%s'", table_name)
+
+                self.metadata_cache.upsert(schema_key, table_name, schema_hash, description, samples)
+                LOGGER.debug("Persisted metadata for table '%s' into cache.", table_name)
+
+                columns = [
+                    replace(column, sample_values=samples.get(column.name))
+                    for column in summary.columns
+                ]
+                hydrated_summary = replace(summary, columns=columns, description=description)
+                LOGGER.debug("Finished metadata hydration for table '%s'", table_name)
+                return hydrated_summary
+            except Exception as exc:  # noqa: BLE001
+                LOGGER.exception("Failed to hydrate metadata for table '%s': %s", table_name, exc)
+                return summary
+
+        if total_tables > 50:
+            max_workers = min(5, total_tables)
+            LOGGER.info(
+                "Using ThreadPoolExecutor with %s worker(s) for metadata hydration.",
+                max_workers,
             )
+            updated_map: Dict[str, TableSummary] = {}
+            with ThreadPoolExecutor(max_workers=max_workers) as executor:
+                future_map = {
+                    executor.submit(process_summary, summary): (idx, summary.name)
+                    for idx, summary in enumerate(summaries)
+                }
+                for future in as_completed(future_map):
+                    idx, table_name = future_map[future]
+                    try:
+                        updated_map[table_name] = future.result()
+                    except Exception as exc:  # noqa: BLE001
+                        LOGGER.exception(
+                            "Unhandled exception hydrating table '%s': %s",
+                            table_name,
+                            exc,
+                        )
+                        updated_map[table_name] = summaries[idx]
+            updated_summaries = [
+                updated_map.get(summary.name, summary) for summary in summaries
+            ]
+        else:
+            updated_summaries = [process_summary(summary) for summary in summaries]
+
         self.schema_summaries = updated_summaries
+        LOGGER.info("Metadata hydration complete for %s table(s).", total_tables)
 
     def _schema_key(self) -> str:
         if self.db_config.schema:
@@ -347,7 +426,7 @@ class AnalyticsService:
             for column in summary.columns
         )
         fk_text = (
-            "\n".join(f"- {fk}" for fk in summary.foreign_keys)
+            "\n".join(f"- {_format_fk_detail(fk)}" for fk in summary.foreign_keys)
             if summary.foreign_keys
             else "none"
         )
@@ -359,18 +438,20 @@ class AnalyticsService:
             f"Columns:\n{column_lines}\n"
             f"Foreign keys:\n{fk_text}\n"
         )
+        description = None
         try:
-            response = self.llm.invoke(
-                [
-                    SystemMessage(
-                        content=(
-                            "You are a senior data analyst documenting a data warehouse. "
-                            "Be accurate, concise, and use business-friendly language."
-                        )
-                    ),
-                    HumanMessage(content=prompt),
-                ]
-            )
+            with self._llm_lock:
+                response = self.llm.invoke(
+                    [
+                        SystemMessage(
+                            content=(
+                                "You are a senior data analyst documenting a data warehouse. "
+                                "Be accurate, concise, and use business-friendly language."
+                            )
+                        ),
+                        HumanMessage(content=prompt),
+                    ]
+                )
             description = getattr(response, "content", None)
         except Exception as exc:  # noqa: BLE001
             LOGGER.debug("LLM description generation failed for %s: %s", summary.name, exc)
@@ -381,9 +462,7 @@ class AnalyticsService:
         column_descriptions = ", ".join(
             f"{column.name} ({column.type})" for column in summary.columns
         )
-        fk_description = (
-            "; ".join(summary.foreign_keys) if summary.foreign_keys else "none"
-        )
+        fk_description = "; ".join(_format_fk_detail(fk) for fk in summary.foreign_keys) if summary.foreign_keys else "none"
         return (
             f"Table {summary.name} contains columns {column_descriptions}. "
             f"Foreign keys: {fk_description}."
