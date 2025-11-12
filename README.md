@@ -61,8 +61,24 @@ Detailed walkthrough: see [`docs/query_flow_example.md`](docs/query_flow_example
 
 ### macOS specifics
 
-1. Install Homebrew (optional) then `brew install python git`.
-2. For Oracle 21c Instant Client: download the mac package and follow Oracle instructions. Set `DYLD_LIBRARY_PATH`.
+1. Install Xcode Command Line Tools so a compiler and SDK headers are available: `xcode-select --install`.
+2. Install Homebrew (optional) then install the runtime and build prerequisites required by the Python dependencies:
+
+   ```bash
+   brew install python git cmake ninja pkg-config unixodbc
+   brew install apache-arrow
+   ```
+
+   - `cmake`, `ninja`, and `pkg-config` are needed when `pip` has to build native wheels such as `pyarrow` (pulled in by `snowflake-sqlalchemy`) on machines where prebuilt binaries are unavailable.
+   - `unixodbc` installs the headers required for `pyodbc`.
+   - `apache-arrow` provides the Arrow C++ libraries used by `pyarrow` if a wheel cannot be downloaded for your macOS version.
+3. (Optional but recommended) Upgrade packaging tools inside your virtual environment before installing project dependencies:
+
+   ```bash
+   python -m pip install --upgrade pip setuptools wheel
+   ```
+
+4. For Oracle 21c Instant Client: download the mac package and follow Oracle instructions. Set `DYLD_LIBRARY_PATH`.
 
 ### Linux specifics
 
