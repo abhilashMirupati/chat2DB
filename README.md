@@ -1,280 +1,356 @@
 # SQLAI
 
-Natural language analytics agent that connects to your databases, generates SQL, runs it safely, and presents the results in a Streamlit UI.
-
-## 1. What this project does
-
-Imagine asking “Which test set had the most failures last week?” and getting:
-
-1. **A SQL query** that actually works for your database dialect.
-2. **A data preview, chart, and plain language summary.**
-3. **Safety checks** so we do not touch tables we do not know about, the SQL stays read only, and every query is capped.
-
-That is the goal of SQLAI. You provide the connection details and the LLM/embedding provider, and the agent handles the rest:
-
-- Introspects the schema (tables, columns, foreign keys, sample rows).
-- Builds a graph-based context for the LLM (Graph-RAG).
-- Generates a plan, guarded SQL, and summaries.
-- If the database returns an error, a **gatekeeper loop** critiques the SQL, repairs it automatically, and tries again (up to three attempts).
-
-## 2. Architecture at a glance
-
-```
-Streamlit UI
-    ↓ sidebar collects DB + LLM settings
-AnalyticsService (src/sqlai/services/analytics_service.py)
-    ↓ creates SQLAlchemy engine, loads schema, graph context
-LangGraph workflow (src/sqlai/agents/query_agent.py)
-    plan → intent critic/repair loop → execute → post-exec critic/repair loop → summarise
-        plan node        : LLM + Graph-RAG context builds plan JSON
-        intent critic    : second LLM checks the SQL before execution (does it answer the question?)
-        intent repair    : optional loop (max 5 tries) to rewrite SQL before it ever hits the database
-        guard            : validate_sql / repair_sql add limits, sanity checks
-        execute node     : runs sql via pandas.read_sql_query
-        post critic node : gatekeeper LLM judges runtime failures, suggests fixes
-        post repair node : LLM rewrites SQL using critic hints (max 3 tries)
-        summarise node   : LLM explains results, charts, follow-ups
-Supporting modules
-    embeddings       : Hugging Face or Ollama similarity for retrieval
-    database         : connectors, external table helpers, metadata filters
-    ui/app.py        : Streamlit layout, status messages, result rendering
-```
-
-Detailed walkthrough: see [`docs/query_flow_example.md`](docs/query_flow_example.md) for a step-by-step example of a complex query flowing through each node.
-
-## 3. Prerequisites
-
-| Requirement                   | Notes                                                                 |
-|------------------------------|-----------------------------------------------------------------------|
-| Python 3.10 or 3.11          | Check with `python --version`.                                        |
-| Git                          | Optional but recommended.                                             |
-| Oracle Instant Client        | Only if you use Oracle. Place DLLs/so files on the machine running the agent. |
-| Databases                    | Any SQLAlchemy URL works (Oracle, Postgres, MySQL, SQL Server, SQLite, etc.). |
-| LLM provider credentials     | Ollama (local) or API key for OpenAI / Anthropic / Azure / Hugging Face. |
-| Embedding provider           | Optional but recommended. Hugging Face token or Ollama model name.     |
-
-### Windows specifics
-
-1. Install Python from https://www.python.org/. During setup tick “Add Python to PATH”.
-2. Install Git from https://git-scm.com/ if you want version control.
-3. For Oracle: install the Instant Client (Basic or Basic Light) and set `PATH` to include its directory.
-
-### macOS specifics
-
-1. Install Xcode Command Line Tools so a compiler and SDK headers are available: `xcode-select --install`.
-2. Install Homebrew (optional) then install the runtime and build prerequisites required by the Python dependencies:
-
-   ```bash
-   brew install python git cmake ninja pkg-config unixodbc
-   brew install apache-arrow
-   ```
-
-   - `cmake`, `ninja`, and `pkg-config` are needed when `pip` has to build native wheels such as `pyarrow` (pulled in by `snowflake-sqlalchemy`) on machines where prebuilt binaries are unavailable.
-   - `unixodbc` installs the headers required for `pyodbc`.
-   - `apache-arrow` provides the Arrow C++ libraries used by `pyarrow` if a wheel cannot be downloaded for your macOS version.
-3. (Optional but recommended) Upgrade packaging tools inside your virtual environment before installing project dependencies:
-
-   ```bash
-   python -m pip install --upgrade pip setuptools wheel
-   ```
-
-4. For Oracle 21c Instant Client: download the mac package and follow Oracle instructions. Set `DYLD_LIBRARY_PATH`.
-
-### Linux specifics
-
-1. Use your package manager to install Python (`sudo apt-get install python3 python3-venv`).
-2. For Oracle: install Instant Client RPM/zip and set `LD_LIBRARY_PATH`.
-
-## 4. Installation (fresh laptop walk-through)
-
-The project ships with all Python dependencies specified in `pyproject.toml`. Installing with `pip install -e .[extras]` ensures a reproducible environment across Windows/macOS/Linux. For a first-time setup on a clean machine, follow the steps below.
-
-```bash
-# Clone or download the repo
-git clone https://github.com/your-org/sqlai.git
-cd sqlai
-
-# Create isolated environment
-python -m venv .venv
-
-# Activate the environment
-# Windows PowerShell
-.\.venv\Scripts\Activate
-# macOS / Linux
-source .venv/bin/activate
-
-# Install dependencies (core + optional extras)
-pip install -e ".[openai,anthropic,ollama,huggingface]"
-```
-
-The editable install (`pip install -e`) means code changes are picked up immediately.
-
-### Environment variables (optional but helpful)
-Create a `.env` file in the project root:
-
-```
-SQLAI_DB_URL=oracle+oracledb://user:password@host:1521/?service_name=ORCLPDB1
-SQLAI_DB_SCHEMA=AGENT_DEMO
-SQLAI_LLM_PROVIDER=huggingface
-SQLAI_LLM_MODEL=meta-llama/Meta-Llama-3-8B-Instruct
-SQLAI_LLM_BASE_URL=https://router.huggingface.co/v1
-SQLAI_LLM_API_KEY=hf_xxxxx
-SQLAI_EMBED_PROVIDER=huggingface
-SQLAI_EMBED_MODEL=google/embeddinggemma-300m
-SQLAI_EMBED_API_KEY=hf_xxxxx
-SQLAI_LOG_LEVEL=DEBUG
-SQLAI_BRAND_NAME=Silpa Analytics Lab
-# Optional: point to a PNG/SVG/JPEG logo that appears in the sidebar
-SQLAI_BRAND_LOGO_PATH=C:\path\to\logo.png
-```
-
-All entries are optional. The Streamlit UI lets you override them at runtime. `SQLAI_BRAND_NAME` / `SQLAI_BRAND_LOGO_PATH` show your branding in the sidebar (defaults to `assets/logo.*` if present).
-
-### Oracle connection strings
-
-SQLAlchemy requires the `oracle+oracledb://user:password@host:port/?service_name=...` format. If you have a JDBC string such as
-
-```
-jdbc:oracle:thin:@(DESCRIPTION=(ADDRESS=(PROTOCOL=tcp)(HOST=hostname)(PORT=1521))(CONNECT_DATA=(SERVER=DEDICATED)(SERVICE_NAME=erdtqcp)))
-```
-
-convert it by extracting host/port/service and supplying credentials:
-
-```
-oracle+oracledb://user:password@hostname:1521/?service_name=erdtqcp
-```
-
-## 5. Running the application
-
-```bash
-# From the repo root with the venv activated
-python run_app.py
-```
-
-Streamlit prints a local URL (default `http://localhost:8501`). Open it in your browser.
-
-> **Tip:** To avoid the UI doing this work on the first launch, you can pre-warm the table metadata cache:
->
-> ```bash
-> # macOS / Linux
-> python scripts/prewarm_metadata.py
-> ```
->
-> ```powershell
-> # Windows PowerShell
-> .\scripts\prewarm_metadata.ps1
-> ```
->
-> The cache lives at `.cache/table_metadata.db`.
-
-### Sidebar workflow
-
-1. **Load/Save profiles** – store DB + LLM + embedding settings to reuse later.
-2. **Database section**
-   - Pick the database type (Oracle, Postgres…). The connection string template updates accordingly.
-   - Optional Oracle thick mode options (Instant Client path, TNS config).
-   - Click “Test database connection” to verify credentials. If Oracle external tables error (ORA-29913 / ORA-29400), resolve the underlying file paths first.
-3. **LLM section**
-   - Choose provider & model. For Hugging Face, either supply API key (router endpoint) or base URL for a custom deployment.
-   - “Test LLM connection” sends a ping request; any authentication issues surface here.
-4. **Embeddings section**
-   - Optional but recommended for better table/column retrieval.
-   - For Hugging Face, the test button calls `sentence_similarity` exactly like their official snippet. If you use router models (e.g., `google/embeddinggemma-300m`), no base URL is needed.
-5. **Initialise Agent**
-   - Builds the engine, introspects schema (tables, columns, FKs), sets up the LangGraph workflow, and opens a session.
-6. Ask questions. Results appear in the main pane together with plan JSON, SQL statements, previews, charts, and follow-ups.
-
-### Saved queries & replay
-
-- Every successful question is saved per schema in `.cache/conversation_history.db` with its SQL, plan JSON, and summary.
-- The main pane now has a **Saved queries** expander. Use **Run** to replay the stored SQL instantly (skips the LLM) or **Load** to drop the original question back into the text box for refinement.
-- Cached runs still honour the guardrails (row limits, schema filtering) because the SQL is re-executed against the current database.
-- Delete the cache file if you need a clean slate.
-
-## 6. How a question is answered (end-to-end)
-
-1. **Semantic retrieval** – `SemanticRetriever.select_cards()` combines heuristic matches with embedding similarity to pick the most relevant table/column “cards”. The details are logged (`Retrieval details` in DEBUG log).
-2. **Planner LLM** – `plan` node invokes the Graph-RAG prompt, producing JSON with plan steps, SQL, tests, summary, chart hints, etc.
-3. **Guardrails** – `validate_sql` ensures all tables are known, row caps are enforced, dialect mismatches are normalized (e.g. convert Oracle `FETCH FIRST` to Postgres `LIMIT`), and metadata views are handled safely.
-4. **Execution** – Pandas executes the SQL. Dataframes are stored in `ExecutionResult` objects.
-5. **Gatekeeper loop**
-   - If execution fails, the **critic** prompt inspects the SQL, plan and error, providing reasons and repair hints.
-   - The **repair** prompt rewrites the SQL using those hints.
-   - The loop tries up to **three repairs**. After each repair the guard re-checks the SQL before execution.
-   - If all attempts fail, the final error message shows the last SQL and critic reasons.
-6. **Summariser** – takes the question, plan rationale, executed SQL, preview tables, and returns a readable answer plus chart instructions. If an error remained, it reports the failure instead of a summary.
-
-## 7. Logging & debugging
-
-Set `SQLAI_LOG_LEVEL=DEBUG` to see:
-- Retrieval scores (`semantic_tables`, `semantic_columns`).
-- Planned SQL and rewrite notes (e.g. “Adjusted metadata query to use ALL_TABLES…”).
-- Critic verdicts and repair attempts.
-- Exact SQL sent to the database and any errors (tracebacks).
-
-Common Oracle issues:
-- **ORA-00904** – usually alias or column typo. The critic will call this out. The repair loop should fix it, but if not, capture the failing SQL and adjust your schema prompts or add domain templates.
-- **ORA-29913 / ORA-29400 / KUP-04044** – external table file missing/inaccessible. Fix the external table configuration; no amount of SQL rewriting can solve it.
-- **ORA-00933** – invalid row-limit clause. The guard now removes stray `ROWNUM` usage and normalises the clause.
-
-## 8. Project structure
-
-```
-README.md              ← you are here
-run_app.py             ← Streamlit entry point
-pyproject.toml         ← dependencies / extras
-src/sqlai/
-    agents/            ← LangGraph nodes, guard, repair loop
-    database/          ← SQLAlchemy connectors, schema introspection
-    graph/             ← Graph context builders (table/column cards)
-    llm/               ← Providers + prompt templates
-    semantic/          ← Embedding-based retriever
-    services/          ← AnalyticsService orchestrator, visualisation
-    ui/                ← Streamlit app and profile store
-    utils/             ← Logging helpers
-```
-
-## 9. Customisation points
-
-- **Domain fallbacks**: `services/domain_fallbacks.py` contains templates for frequently used metadata queries (count tables, list columns, failure summaries). Extend this with your domain-specific SQL patterns.
-- **Embeddings**: add new providers by implementing `SimilarityProvider` in `semantic/retriever.py`.
-- **LLM providers**: plug in new LangChain chat models via `llm/providers.py`.
-- **Visualisations**: extend `services/visualization.py` to map chart specs to Plotly (or other libraries).
-- **Branding**: set `SQLAI_BRAND_NAME` / `SQLAI_BRAND_LOGO_PATH` (PNG/JPG/SVG) to add your own name and logo to the Streamlit sidebar. If no path is provided, the app automatically looks for `assets/logo.(png|jpg|jpeg|svg|webp)`.
-
-## 10. Testing ideas
-
-We recommend adding automated tests under `tests/`:
-- Mock database metadata and ensure the planner emits the expected SQL.
-- Verify the critic/repair loop corrects common errors (alias mismatch, limit clause).
-- Check metadata rewrites (`user_tables` → `all_tables`) for Oracle and no-op for other dialects.
-
-## 11. Troubleshooting checklist
-
-| Symptom                                  | Likely cause / fix                                                   |
-|-----------------------------------------|-----------------------------------------------------------------------|
-| “Unknown tables referenced”              | Table not in schema cache; reinitialise agent after selecting schema. |
-| ORA-00904 “invalid identifier”           | Alias/column mismatch; critic should highlight. Repair loop will fix. |
-| ORA-00933 “SQL command not properly ended” | Row-limit clause in wrong dialect; guard now normalises automatically. |
-| ORA-29913 / ORA-29400 / KUP-04044        | Oracle external table cannot access file. Fix file path/permissions.  |
-| Hugging Face 401                         | Token missing scope or model access. Accept model licence, regenerate token. |
-| Hugging Face 410                         | Model not served on public inference API. Deploy your own endpoint or choose another model. |
-| LLM returns no SQL                       | Plan JSON will include `sql_generation_note`. Provide clearer question or ensure schema/metadata exists. |
-| Semantic retrieval missing tables        | Check embedding provider configuration, run “Test embedding connection” to confirm success. |
-
-## 12. Contributing & support
-
-1. Fork the repo, create a topic branch, and open a pull request.
-2. File issues with:
-   - Database dialect and URL
-   - Exact question asked
-   - DEBUG log snippet (plan, critic verdict, repair attempts)
-   - Steps to reproduce
-
-## 13. Credits & license
-
-MIT License. Built for teams who want to “talk to their data” without wiring up bespoke dashboards for every question.
+Production-ready Graph-RAG agent that connects to your databases, generates safe SQL, and explains the results in a Streamlit UI.
 
 ---
-*Tip: enable `SQLAI_LOG_LEVEL=DEBUG` during initial setup to see exactly how the agent reasons about your schema and queries.*
+## Contents
+1. [Overview](#overview)
+2. [Architecture](#architecture)
+3. [Component Breakdown](#component-breakdown)
+4. [Installation & Setup](#installation--setup)
+5. [Configuration](#configuration)
+6. [Prewarm & Runtime Workflow](#prewarm--runtime-workflow)
+7. [Retrieval & Guardrails](#retrieval--guardrails)
+8. [Observability & Production Checklist](#observability--production-checklist)
+9. [Repository Layout](#repository-layout)
+10. [Contributing & License](#contributing--license)
 
+---
+## Overview
+
+SQLAI is designed for enterprise teams who need trustworthy, self-healing SQL generation:
+
+- **Graph-RAG context** from live schema introspection, cached in SQLite, embedded in Chroma.
+- **LangGraph workflow** with planner, pre-execution critic/repair, deterministic guardrails, post-execution critic/repair, and summariser.
+- **Streamlit UI** with saved profiles, connection testers, saved query replay, and detailed plan/SQL previews.
+- **Headless prewarm** script for production deployments so cold starts are fast.
+
+---
+## Architecture
+
+```mermaid
+flowchart TD
+    A[Launch UI or prewarm script] --> B[Load configs & validate]
+    B --> C[Introspect schema\n(sqlalchemy.inspect)]
+    C --> D[Hydrate metadata\nLLM descriptions + samples]
+    D --> E[Build GraphContext\nTable/Column/Relationship cards]
+    E --> F[Persist graph cards\nSQLite cache]
+    F --> G[Embed table cards only\nChroma namespace per model]
+    G --> H[User question\nStreamlit UI]
+    H --> I[SemanticRetriever\nTable-only search]
+    I --> I1[Stage 1: Semantic search\nTable cards only]
+    I1 --> I2[Stage 2: FK expansion\nAdd referenced tables]
+    I2 --> I3[Stage 3: Get ALL columns\nfor selected tables]
+    I3 --> I4[Stage 4: Get ALL relationships\nfor selected tables]
+    I4 --> J[Planner LLM\nLangGraph plan node]
+    J --> K[Intent critic/repair\npre-exec gatekeeper]
+    K --> K1[SQLGlot Transpile\nConvert to target dialect]
+    K1 --> L[Execute SQL\nvalidate_sql + pandas]
+    L --> M[Post critic/repair\nruntime gatekeeper]
+    M --> N[Summariser LLM\nanswer + chart + follow-ups]
+    N --> O[Persist answer\nconversation history + saved queries]
+```
+
+**Graph Context Structure:**
+- **TableCard**: Table name, schema, LLM-generated description, row estimate, trimmed column list
+- **ColumnCard**: Column name, type, nullable/default, sample values (5), comments
+- **RelationshipCard**: Foreign key relationships (FK edges between tables)
+
+**Caches & storage**
+- `.cache/table_metadata.db` – table descriptions + column samples (LLM-generated).
+- `.cache/graph_cards.db` – rendered cards (table/column/relationship) with schema hashes.
+- `.cache/vector_store/<provider>__<model>/` – Chroma index per embedding model (table cards only).
+- `.cache/conversation_history.db` – successful interactions for replay.
+
+---
+## Component Breakdown
+
+| Layer | Responsibilities | Key files |
+|-------|------------------|-----------|
+| Streamlit UI | Profiles, connection tests, question handling, result rendering, saved query replay | `src/sqlai/ui/app.py`, `profile_store.py` |
+| AnalyticsService | DB engine, metadata hydration, GraphContext build, LangGraph orchestration, cache sync | `src/sqlai/services/analytics_service.py` |
+| Graph & vector caches | Persist rendered cards, embed table cards via Chroma, support warm restarts | `graph_cache.py`, `vector_store.py` |
+| LangGraph workflow | Planner, intent critic/repair, execution node, post critic/repair, summariser | `src/sqlai/agents/query_agent.py` |
+| Guardrails | SQLGlot transpilation, deterministic SQL validation/repair (row caps, dialect rewrites, literal alignment) | `src/sqlai/guards/sql_guard.py`, `src/sqlai/utils/sql_transpiler.py` |
+| Retrieval | Two-stage: table-only semantic search → FK expansion → get ALL columns/relationships | `src/sqlai/semantic/retriever.py` |
+| Graph Context | TableCard, ColumnCard, RelationshipCard builders and formatters | `src/sqlai/graph/context.py` |
+
+---
+## Installation & Setup
+
+### Prerequisites
+
+| Requirement | Notes |
+|-------------|-------|
+| Python 3.10 / 3.11 | `python --version` |
+| Git | optional but useful |
+| Oracle Instant Client | only for Oracle; update PATH/LD_LIBRARY_PATH |
+| Database access | SQLAlchemy URL (Oracle, Postgres, MySQL, SQL Server, SQLite, …) |
+| LLM credentials | Ollama (local) or API key (OpenAI / Anthropic / Hugging Face / Azure) |
+| Embedding provider | Required for Graph-RAG (Hugging Face token or Ollama model) |
+
+### Create virtual environment
+```bash
+git clone https://github.com/your-org/sqlai.git
+cd sqlai
+python -m venv .venv
+source .venv/bin/activate              # Windows: .\.venv\Scripts\Activate
+pip install -e ".[openai,anthropic,ollama,huggingface]"
+pip install chromadb
+```
+
+---
+## Configuration
+
+Create `.env` in the repo root:
+
+```
+SQLAI_DB_URL=oracle+oracledb://user:password@host:1521/?service_name=XEPDB1
+SQLAI_DB_SCHEMA=AGENT_DEMO
+
+SQLAI_LLM_PROVIDER=huggingface
+SQLAI_LLM_MODEL=defog/llama-3-sqlcoder-8b:featherless-ai
+SQLAI_LLM_BASE_URL=https://router.huggingface.co/v1
+SQLAI_LLM_API_KEY=hf_xxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxx
+
+SQLAI_EMBED_PROVIDER=huggingface
+SQLAI_EMBED_MODEL=google/embeddinggemma-300m
+SQLAI_EMBED_API_KEY=hf_xxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxx
+
+SQLAI_VECTOR_PROVIDER=chroma
+# Optional overrides:
+# SQLAI_VECTOR_PATH=.cache/vector_store
+# SQLAI_VECTOR_COLLECTION=graph_cards
+
+SQLAI_LOG_LEVEL=INFO
+SQLAI_BRAND_NAME=Silpa Analytics Lab
+# SQLAI_BRAND_LOGO_PATH=C:\path\to\logo.png
+```
+
+Database, chat LLM, and embedding LLM settings are mandatory. `defog/*` models automatically route to the correct Hugging Face endpoint; others fall back to `https://router.huggingface.co/hf-inference`.
+
+---
+## Prewarm & Runtime Workflow
+
+### Prewarm (recommended for prod)
+```bash
+python scripts/prewarm_metadata.py
+# Windows PowerShell
+.\scripts\prewarm_metadata.ps1n
+```
+Hydrates table descriptions, column samples, graph cards, and vector embeddings without launching Streamlit.
+
+### Run the UI
+```bash 
+python run_app.py
+```
+Open the printed URL (default `http://localhost:8501`).
+
+### Sidebar workflow
+1. Load or create a profile.
+2. Configure DB URL + schema; **Test database connection**.
+3. Configure chat LLM; **Test LLM connection**.
+4. Configure embeddings; **Test embedding connection**.
+5. Click **Initialise Agent** (uses prewarm caches if available).
+6. Ask questions; inspect plan JSON, SQL preview, Table preview, charts, and follow-ups.
+7. Use **Saved queries** to replay cached SQL from `.cache/conversation_history.db`.
+
+---
+## Retrieval & Guardrails
+
+### Graph Context Building
+
+**Graph cards** are structured representations of your database schema:
+
+- **`TableCard`**: 
+  - Table name, schema, row estimate
+  - LLM-generated description (business-friendly explanation)
+  - Trimmed column list (first 12 columns for overview)
+  
+- **`ColumnCard`**: 
+  - Column name, type, nullable/default
+  - Sample values (5 representative values from actual data)
+  - Column comments (if available)
+  
+- **`RelationshipCard`**: 
+  - Foreign key relationships (FK edges)
+  - Format: `schema.table[column] -> schema.referred_table[referred_column]`
+
+Rendered cards are cached in `.cache/graph_cards.db` and **only table cards are embedded** in ChromaDB under `.cache/vector_store/<provider>__<model>/`.
+
+### Two-Stage Semantic Retrieval
+
+**Why table-only search?** 
+- Prevents noise from irrelevant table columns
+- Ensures columns belong to relevant tables
+- More semantically correct: tables first, then their columns
+
+**Retrieval Process:**
+
+1. **Stage 1: Table Selection** (Semantic search on table cards only)
+   - Heuristic ranking: keyword matching on table/column names
+   - On-the-fly semantic similarity: embedding-based table ranking (fallback)
+   - Vector store search: queries ChromaDB with `where={"card_type": "table"}`
+   - Merge results: combines heuristic + semantic + vector scores
+   - Select top-K tables (default: 6)
+
+2. **Stage 2: FK Expansion** (1-hop expansion)
+   - Automatically includes tables referenced by foreign keys
+   - **Outgoing FKs** (priority): If selected table has FK → other table, add that table
+   - **Incoming FKs** (secondary): If other table has FK → selected table, add that table
+   - Safety limit: Max 5 additional tables to prevent context explosion
+   - **Why?** Ensures complete join paths even if referenced tables weren't semantically matched
+
+3. **Stage 3: Column Retrieval** (No semantic search)
+   - Gets **ALL columns** for selected tables (including expanded)
+   - No semantic filtering - ensures no important columns are missed
+   - Includes foreign keys, join columns, and all other columns
+   - Case-insensitive matching for table names
+   - Limited to `max_columns` if exceeds limit (prioritizes by heuristic)
+
+4. **Stage 4: Relationship Retrieval**
+   - Gets **ALL relationships** for selected tables (including expanded)
+   - Includes both directions (outgoing and incoming FKs)
+   - Ensures complete join paths are available to LLM
+
+**What gets passed to LLM:**
+
+The `GraphContext` passed to the planner includes:
+- **Selected tables**: Top-K semantically matched tables + FK-expanded tables
+- **All columns**: Every column from selected tables (not just top-K)
+- **All relationships**: Every FK relationship involving selected tables
+- **Value anchors**: Sample values from columns for realistic filters
+- **Retrieval details**: Metadata about which tables/columns were selected and why
+
+**Example:**
+```
+Query: "What are the test sets with max failures?"
+
+Stage 1: Semantic search → [test_sets, executions] (top 2)
+Stage 2: FK expansion → executions → test_cases (+1) → [test_sets, executions, test_cases]
+Stage 3: Get ALL columns → 13 columns from 3 tables
+Stage 4: Get ALL relationships → 2 FK relationships
+
+Passed to LLM:
+- 3 tables (with descriptions)
+- 13 columns (with types, samples, nullable)
+- 2 relationships (complete join paths)
+```
+
+### Graph Context Formatting for LLM
+
+The `GraphContext.prepare_prompt_inputs()` method formats the retrieved cards into structured text for the LLM prompt:
+
+**Table Cards Format:**
+```
+schema.table_name | rows≈estimate
+  comment: LLM-generated description
+  columns: col1 (TYPE), col2 (TYPE, nullable), ...
+```
+
+**Column Cards Format:**
+```
+schema.table.column | type=TYPE | nullable=Tr ue/False | default=VALUE | values≈[sample1, sample2, ...]
+```
+
+**Relationship Cards Format:**
+```
+schema.table[column] -> schema.referred_table[referred_column]
+```
+
+**Prompt Structure:**
+- `table_cards`: All selected table cards (one per line, separated by blank lines)
+- `column_cards`: All selected column cards (one per line)
+- `relationship_map`: All selected relationships (one per line)
+- `column_facts`: Column metadata summary
+- `value_anchors`: Sample values for realistic filters
+- `k_tables`: Count of selected tables
+- `k_columns`: Count of selected columns
+
+This structured format ensures the LLM has complete schema information, sample values, and join paths to generate accurate SQL.
+
+### Guarded execution
+- **SQLGlot transpilation** (mandatory): Automatically converts SQL to the target database dialect if LLM generates wrong-dialect SQL. Supports Oracle, PostgreSQL, MySQL, SQL Server, SQLite, Snowflake, BigQuery, and more.
+- `validate_sql` enforces row caps, read-only queries, literal alignment, and dialect normalization.
+- `repair_sql` patches missing limits, metadata rewrites, and dialect quirks.
+- **Intent critic** (pre-execution) ensures SQL answers the question before hitting the DB (max 5 iterations).
+- **Post critic** inspects runtime errors, provides fixes, and retries (max 3 iterations).
+- **Robust JSON parsing** for planner, intent critic/repair, and post critic/repair: malformed JSON (e.g., trailing commas) is auto-fixed so critique and repair always run.
+- **Schema-aware SQL normalization (universal):**
+  - Column-name repair: if a referenced column does not exist, map to the closest valid column from the joined tables (e.g., `result` → `status`) using string similarity against the GraphContext.
+  - Alias remap: if a qualified column belongs to a different joined table, re-qualify automatically (e.g., `tc.status` → `e.status` when `status` exists only on `executions`).
+  - Runs before validation/execution; database-agnostic, no query-specific rules.
+- Summariser LLM blends plan rationale, SQL, preview tables, and execution stats into a business-friendly answer and chart.
+
+---
+## Observability & Production Checklist
+
+### Logging & debugging
+Set `SQLAI_LOG_LEVEL=INFO` or `DEBUG` to see:
+
+**Retrieval logs (INFO level):**
+- Table selection process (heuristic, semantic, vector store)
+- FK expansion details (which tables added, why)
+- Column retrieval (counts per table, total columns)
+- Relationship retrieval (FK paths found)
+- Final summary (tables/columns/relationships passed to LLM)
+
+**Detailed logs (DEBUG level):**
+- Retrieval scores for each table/column
+- Planner JSON output
+- Critic verdicts and repair hints
+- Guardrail patches
+- Executed SQL
+- Metadata hydration progress
+
+UI visibility:
+- The full planner prompt and the final SQL (after all intent repairs) are shown in a Streamlit expander under the answer.
+
+| Symptom | Likely cause / fix |
+|---------|--------------------|
+| `Unknown tables referenced` | Schema cache stale; rerun prewarm or initialise after selecting schema. |
+| `ORA-00904` / `ORA-00933` | Dialect mismatch; guardrail output shows patched SQL. |
+| Hugging Face `401/404/410` | Token lacks access or wrong router; accept license, ensure `.env` base URL correct. |
+| Metadata hydration slow | Run prewarm; caches reduce cold-start time dramatically. |
+| Retrieval misses tables | Embedding provider not configured/tested; run sidebar "Test embedding connection". |
+| Missing FK-referenced tables | FK expansion should auto-include them; check logs for expansion details. If limit reached (5 tables), increase `max_expansion` in retriever. |
+| No columns found for selected tables | Check table name matching (case-insensitive); verify graph_cards.db has columns for those tables. |
+
+### Production deployment checklist
+1. **Secrets management** – inject DB URLs/API keys from Vault/Key Vault/Secrets Manager.
+2. **Prewarm on deploy** – run `scripts/prewarm_metadata.py` in CI/CD or container entrypoint.
+3. **Persistent cache** – mount `.cache/` on durable storage (EFS/Azure Files/host volume).
+4. **Monitoring** – route logs to ELK, CloudWatch, or Log Analytics; add `/healthz` probes to Streamlit container.
+5. **Rate limits** – verify Hugging Face/Ollama quotas match expected concurrency; scale inference services accordingly.
+6. **Rollback plan** – pin repo to tags, snapshot caches, and keep previous images for quick fallback.
+
+---
+## Repository Layout
+
+```
+README.md                # this file
+run_app.py               # Streamlit entry point
+scripts/
+    prewarm_metadata.py  # hydrate metadata/vector caches
+src/sqlai/
+    agents/              # LangGraph nodes/workflow
+    database/            # connectors, schema introspection
+    graph/               # GraphContext builders
+    llm/                 # provider factory + prompts
+    semantic/            # retriever + similarity providers
+    services/            # AnalyticsService, caches, visualisation
+    ui/                  # Streamlit app + profile store
+    utils/               # logging helpers
+    guards/              # SQL guardrails
+```
+
+---
+## Contributing & License
+
+1. Fork → branch → PR.
+2. When filing issues include DB dialect/URL (sanitised), full question, DEBUG log snippets, and repro steps.
+3. Tests should live under `tests/` and mock DB/LLM dependencies.
+
+Licensed under **MIT**. Built so teams can "talk to their data" without wiring bespoke dashboards.
+
+> Tip: keep `SQLAI_LOG_LEVEL=INFO` or `DEBUG` enabled during initial setup to watch the entire reasoning chain, including detailed retrieval logs showing table selection, FK expansion, and column/relationship retrieval.
