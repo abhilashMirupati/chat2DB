@@ -1,0 +1,13 @@
+SQLAI_DB_URL=oracle+oracledb://system:ganesh@localhost:1521/?service_name=XEPDB1
+SQLAI_DB_SCHEMA=AGENT_DEMO
+SQLAI_LLM_PROVIDER=huggingface
+SQLAI_LLM_MODEL=defog/llama-3-sqlcoder-8b:featherless-ai
+#SQLAI_LLM_BASE_URL=http://localhost:11434
+
+#SQLAI_LLM_BASE_URL=https://api-inference.huggingface.co/v1
+SQLAI_LLM_BASE_URL=https://router.huggingface.co/v1
+SQLAI_LLM_API_KEY=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
+SQLAI_EMBED_PROVIDER=huggingface
+SQLAI_EMBED_MODEL=google/embeddinggemma-300m
+SQLAI_EMBED_API_KEY=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
+SQLAI_VECTOR_PROVIDER=chroma
