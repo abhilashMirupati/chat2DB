@@ -6,11 +6,19 @@ from __future__ import annotations
 
 from dataclasses import dataclass
 import logging
-from typing import Any, Dict, List, Optional, Sequence, TypedDict
+from typing import Any, Dict, List, Optional, Sequence, Set, Tuple, TypedDict
 
 import pandas as pd
 from langchain_core.output_parsers import JsonOutputParser
 from langchain_core.prompts import ChatPromptTemplate
+try:
+    from langchain.output_parsers import OutputFixingParser  # Newer LangChain
+except Exception:  # pragma: no cover
+    OutputFixingParser = None  # type: ignore[assignment]
+from langchain_core.messages import AIMessage
+import json
+import re
+import difflib
 try:
     from langgraph.graph import END, StateGraph
 except ImportError as exc:
@@ -28,15 +36,142 @@ from sqlai.llm.prompt_templates import (
 from sqlai.agents.guard import repair_sql, validate_sql
 from sqlai.graph.context import GraphContext
 from sqlai.services.domain_fallbacks import maybe_generate_domain_sql
+from sqlai.utils.sql_transpiler import transpile_sql
+from sqlglot import parse_one, exp
+import sqlglot
 
 LOGGER = logging.getLogger(__name__)
 
-MAX_INTENT_REPAIRS = 5
+MAX_INTENT_REPAIRS = 3
+
+
+def _safe_invoke_json(chain: Any, payload: Dict[str, Any], llm: Any) -> Dict[str, Any]:
+    """
+    Invoke a chain that is expected to return JSON. If parsing fails (e.g., trailing commas),
+    attempt to repair the JSON using OutputFixingParser. As a last resort, return an empty,
+    well-formed structure to keep the workflow moving.
+    
+    Note: The chain typically includes JsonOutputParser, so we need to extract raw response
+    before parsing to capture what the LLM actually returned.
+    """
+    parser = JsonOutputParser()
+    fixer = None
+    if OutputFixingParser is not None:
+        try:
+            fixer = OutputFixingParser.from_llm(parser=parser, llm=llm)  # type: ignore[call-arg]
+        except Exception:  # pragma: no cover
+            fixer = None
+    
+    # Extract the prompt and LLM from chain to get raw response
+    # Chain structure: prompt | llm | parser
+    # We need to invoke prompt | llm to get raw response
+    raw_content = ""
+    try:
+        # Try to get raw response by invoking without parser
+        # Extract components from chain if possible
+        if hasattr(chain, "first") and hasattr(chain, "middle") and hasattr(chain, "last"):
+            # Chain is likely a RunnableSequence
+            prompt_part = chain.first if hasattr(chain, "first") else None
+            llm_part = chain.middle[0] if hasattr(chain, "middle") and len(chain.middle) > 0 else llm
+            if prompt_part and llm_part:
+                raw_response = (prompt_part | llm_part).invoke(payload)
+                raw_content = getattr(raw_response, "content", str(raw_response)) or ""
+        else:
+            # Fallback: try invoking the full chain and see if we can extract raw content
+            result = chain.invoke(payload)
+            # If result is already parsed (dict), we lost the raw content
+            if isinstance(result, dict):
+                # Try to get raw by re-invoking without parser
+                # This is a best-effort approach
+                pass
+            elif hasattr(result, "content"):
+                raw_content = getattr(result, "content", None) or ""
+    except Exception:
+        pass  # Will try chain.invoke below
+    
+    try:
+        result = chain.invoke(payload)
+        # Attach raw content if we captured it
+        if isinstance(result, dict):
+            if raw_content:
+                result["__raw"] = raw_content
+            return result
+        # If result is not a dict, it might be an AIMessage
+        if hasattr(result, "content"):
+            raw_content = getattr(result, "content", None) or raw_content
+            # Try to parse it
+            try:
+                parsed = parser.parse(raw_content) if raw_content else {}
+                if isinstance(parsed, dict):
+                    parsed["__raw"] = raw_content
+                return parsed
+            except Exception:
+                pass
+        return result
+    except Exception as exc:
+        # Try to obtain raw content and repair it
+        if not raw_content:
+            try:
+                # Try to extract prompt and llm from chain
+                if hasattr(chain, "first") and hasattr(chain, "middle"):
+                    prompt_part = chain.first
+                    llm_part = chain.middle[0] if len(chain.middle) > 0 else llm
+                    if prompt_part and llm_part:
+                        raw_response = (prompt_part | llm_part).invoke(payload)
+                        raw_content = getattr(raw_response, "content", str(raw_response)) or ""
+            except Exception:
+                pass
+        
+        if not raw_content:
+            LOGGER.warning("Could not extract raw LLM response for JSON repair. Exception: %s", exc)
+            return {"verdict": "reject", "reasons": [], "repair_hints": [], "__raw": None}
+        
+        try:
+            if fixer is not None:
+                parsed = fixer.parse(raw_content)
+                # Attach raw text for downstream logging
+                if isinstance(parsed, dict):
+                    parsed["__raw"] = raw_content
+                return parsed
+            # Local best-effort repair if OutputFixingParser is unavailable
+            repaired = _best_effort_json_repair(raw_content)
+            repaired["__raw"] = raw_content
+            return repaired
+        except Exception as repair_exc:
+            LOGGER.debug("JSON repair failed: %s. Raw content: %s", repair_exc, raw_content[:500] if raw_content else "<<empty>>")
+            return {"verdict": "reject", "reasons": [], "repair_hints": [], "__raw": raw_content}
+
+
+def _best_effort_json_repair(text: str) -> Dict[str, Any]:
+    """
+    Minimal, generic JSON repair:
+    - Extract first {...} block
+    - Replace single quotes with double quotes when safe
+    - Remove trailing commas before } or ]
+    - Attempt json.loads; fallback to an empty structure
+    """
+    # Extract JSON object if extra prose present
+    start = text.find("{")
+    end = text.rfind("}")
+    if start != -1 and end != -1 and end > start:
+        text = text[start : end + 1]
+    # Replace smart quotes
+    text = text.replace("“", '"').replace("”", '"').replace("’", "'")
+    # Naive single-quote to double-quote for keys only (simple heuristic)
+    text = re.sub(r"'\s*([A-Za-z0-9_\-]+)\s*'\s*:", r'"\1":', text)
+    # Remove trailing commas before } or ]
+    text = re.sub(r",\s*([}\]])", r"\1", text)
+    try:
+        return json.loads(text)
+    except Exception:
+        return {"verdict": "reject", "reasons": [], "repair_hints": []}
 
 
 class QueryState(TypedDict, total=False):
     question: str
     prompt_inputs: Dict[str, Any]
+    formatted_prompt: str  # Full formatted prompt sent to planner LLM
+    final_sql: str  # Final SQL that will be executed (after all intent repairs)
     schema_markdown: str
     dialect_hint: str
     schema_name: str
@@ -149,6 +284,177 @@ def format_schema_markdown(schema: List[Dict[str, Any]]) -> str:
     return "\n".join(lines)
 
 
+def _fail():
+    def node(state: QueryState) -> QueryState:
+        # No further processing; execution_error already set by router
+        message = state.get("execution_error") or "Query failed during intent validation."
+        LOGGER.info("Failing early due to unresolved intent issues: %s", message)
+        # Produce an answer payload so callers don't KeyError
+        return {
+            "answer": {
+                "text": message,
+                "chart": None,
+                "followups": [],
+            },
+            "executions": [],
+        }
+
+    return node
+
+
+def _remap_missing_columns(sql_text: str, graph: Optional[GraphContext]) -> str:
+    """
+    If a qualified column references a table alias whose table does not contain the column,
+    but another joined alias does contain it, remap the qualifier to that alias.
+    This is a generic, schema-aware normalization; it does NOT add or drop joins.
+    """
+    if not isinstance(graph, GraphContext) or not sql_text:
+        return sql_text
+    try:
+        ast = parse_one(sql_text)
+    except Exception:
+        return sql_text
+
+    # Build alias -> table and table -> columns maps
+    alias_to_table: Dict[str, str] = {}
+    for tbl in ast.find_all(exp.Table):
+        alias_expr = tbl.args.get("alias")
+        alias = None
+        if alias_expr is not None:
+            alias = getattr(alias_expr, "this", None)
+            alias = getattr(alias, "name", alias)  # normalize identifier
+        name = getattr(getattr(tbl, "this", None), "name", None)
+        if name:
+            alias_key = (alias or name).lower()
+            alias_to_table[alias_key] = name.lower()
+
+    table_to_columns: Dict[str, set] = {}
+    for table_card in graph.tables:
+        table_to_columns[table_card.name.lower()] = {c.name.lower() for c in table_card.columns}
+
+    changed = False
+    for col in ast.find_all(exp.Column):
+        qualifier = col.table
+        col_name = col.name.lower()
+        if qualifier:
+            qual_key = qualifier.lower()
+            table_name = alias_to_table.get(qual_key)
+            if table_name and col_name not in table_to_columns.get(table_name, set()):
+                # Try to find another alias that has this column
+                for alias_key, tname in alias_to_table.items():
+                    if col_name in table_to_columns.get(tname, set()):
+                        col.set("table", exp.to_identifier(alias_key))
+                        changed = True
+                        break
+    return ast.sql() if changed else sql_text
+
+
+def _repair_unknown_columns(sql_text: str, graph: Optional[GraphContext]) -> str:
+    """
+    If a column name does not exist on the referenced table (or on any joined table),
+    try to map it to the closest valid column name across the joined tables using
+    a string similarity heuristic. If a close match is found, replace the column
+    name (and re-qualify with the alias that owns that column).
+    """
+    if not isinstance(graph, GraphContext) or not sql_text:
+        return sql_text
+    try:
+        ast = parse_one(sql_text)
+    except Exception:
+        return sql_text
+
+    # alias -> table and table -> columns maps
+    alias_to_table: Dict[str, str] = {}
+    for tbl in ast.find_all(exp.Table):
+        alias_expr = tbl.args.get("alias")
+        alias = None
+        if alias_expr is not None:
+            alias = getattr(alias_expr, "this", None)
+            alias = getattr(alias, "name", alias)
+        name = getattr(getattr(tbl, "this", None), "name", None)
+        if name:
+            alias_key = (alias or name).lower()
+            alias_to_table[alias_key] = name.lower()
+
+    table_to_columns: Dict[str, set] = {}
+    all_columns: Dict[str, str] = {}  # column_name -> table_name (first occurrence wins)
+    for table_card in graph.tables:
+        tname = table_card.name.lower()
+        cols = {c.name.lower() for c in table_card.columns}
+        table_to_columns[tname] = cols
+        for cname in cols:
+            all_columns.setdefault(cname, tname)
+
+    changed = False
+    for col in ast.find_all(exp.Column):
+        col_name = col.name.lower()
+        qualifier = col.table.lower() if col.table else None
+
+        # Determine current table (if any) for this qualified column
+        current_table = alias_to_table.get(qualifier) if qualifier else None
+        current_has = current_table and (col_name in table_to_columns.get(current_table, set()))
+        global_has = col_name in all_columns
+
+        if current_has or global_has:
+            continue  # already valid
+
+        # Find closest column name across all known columns
+        candidates = list(all_columns.keys())
+        best = difflib.get_close_matches(col_name, candidates, n=1, cutoff=0.8)
+        if not best:
+            continue
+
+        best_name = best[0]
+        target_table = all_columns[best_name]
+
+        # Find an alias that maps to the target table; if none, skip
+        target_alias = None
+        for alias_key, tname in alias_to_table.items():
+            if tname == target_table:
+                target_alias = alias_key
+                break
+        if not target_alias:
+            continue
+
+        # Apply the repair: rename column and re-qualify with the alias that owns it
+        col.set("this", exp.to_identifier(best_name))
+        col.set("table", exp.to_identifier(target_alias))
+        changed = True
+
+    return ast.sql() if changed else sql_text
+
+
+def _sanitize_sql_list(sql_statements: List[str]) -> List[str]:
+    """
+    Remove non-data 'probe' statements (e.g., SELECT 'pie' FROM dual) and keep only
+    statements that reference actual tables/joins. Heuristics:
+    - Drop statements with no FROM clause
+    - For Oracle, drop SELECT ... FROM dual unless selecting from a function that touches data
+    - Keep first 1-2 meaningful statements max
+    """
+    cleaned: List[str] = []
+    for sql in sql_statements:
+        try:
+            ast = sqlglot.parse_one(sql, read=None)  # auto-detect
+        except Exception:
+            # If can't parse, keep as-is to let guardrails decide
+            cleaned.append(sql)
+            continue
+        has_from = any(isinstance(node, exp.From) for node in ast.find_all(exp.From))
+        if not has_from:
+            # e.g., SELECT 'pie'; drop
+            continue
+        # Detect FROM dual
+        from_tables = [t.this.name.lower() for t in ast.find_all(exp.Table) if hasattr(t.this, "name")]
+        if "dual" in from_tables and len(from_tables) == 1:
+            # likely a probe, drop
+            continue
+        cleaned.append(sql)
+        if len(cleaned) >= 2:
+            break
+    return cleaned or sql_statements[:1]
+
+
 def create_query_workflow(llm: Any, engine: Engine) -> Any:
     """
     Compile a LangGraph for the SQL query workflow.
@@ -162,19 +468,44 @@ def create_query_workflow(llm: Any, engine: Engine) -> Any:
     graph.add_node("critic", _critic_sql(llm))
     graph.add_node("repair", _repair_sql(llm))
     graph.add_node("summarise", _summarise(llm))
+    graph.add_node("fail", _fail())
 
     graph.set_entry_point("plan")
-    graph.add_edge("plan", "intent_critic")
+    # Route after planning: if no SQL, fail early with a clear message
+    def _route_after_plan(state: QueryState) -> str:
+        plan = state.get("plan") or {}
+        sql = plan.get("sql")
+        if not sql or (isinstance(sql, str) and not sql.strip()) or (isinstance(sql, list) and not any((s or "").strip() for s in sql)):
+            # ensure execution_error is set by planner node; if not, set a generic one
+            if not state.get("execution_error"):
+                state["execution_error"] = "Planner failed to produce SQL for the question."
+            return "fail"
+        return "intent_critic"
+    graph.add_conditional_edges("plan", _route_after_plan, {"intent_critic": "intent_critic", "fail": "fail"})
     graph.add_conditional_edges(
         "intent_critic",
         _route_after_intent,
         {
             "repair": "intent_repair",
             "execute": "execute",
-            "fail": "summarise",
+            "fail": "fail",
         },
     )
-    graph.add_edge("intent_repair", "intent_critic")
+    # After an intent repair, conditionally continue or fail to avoid an extra 4th critic call
+    def _route_after_intent_repair(state: QueryState) -> str:
+        attempts = state.get("intent_attempts", 0)
+        last_critic = state.get("intent_critic") or {}
+        if attempts >= MAX_INTENT_REPAIRS:
+            reasons = last_critic.get("reasons") or []
+            sql = state.get("plan", {}).get("sql")
+            state["execution_error"] = (
+                "Unable to produce SQL that satisfies the question after "
+                f"{attempts} intent repair attempt(s).\n"
+                f"Reasons: {reasons}\n\nLast SQL:\n{sql}"
+            )
+            return "fail"
+        return "intent_critic"
+    graph.add_conditional_edges("intent_repair", _route_after_intent_repair, {"intent_critic": "intent_critic", "fail": "fail"})
     graph.add_conditional_edges(
         "execute",
         _needs_critique,
@@ -187,6 +518,7 @@ def create_query_workflow(llm: Any, engine: Engine) -> Any:
     )
     graph.add_edge("repair", "execute")
     graph.add_edge("summarise", END)
+    graph.add_edge("fail", END)
 
     return graph.compile()
 
@@ -200,17 +532,156 @@ def _plan_sql(llm: Any):
         LOGGER.debug("Planning SQL for question=%s", state.get("question"))
         prompt_inputs = dict(state.get("prompt_inputs") or {})
         prompt_inputs.setdefault("user_question", state.get("question", ""))
-        plan = chain.invoke(prompt_inputs)
+        
+        # Log what's being passed to the prompt (summary)
+        LOGGER.info("Prompt inputs summary: table_cards=%d chars, column_cards=%d chars, relationship_map=%d chars",
+                   len(prompt_inputs.get("table_cards", "") or ""),
+                   len(prompt_inputs.get("column_cards", "") or ""),
+                   len(prompt_inputs.get("relationship_map", "") or ""))
+        
+        # Format the prompt to get the actual messages that will be sent to LLM
+        formatted_prompt_text = ""
+        try:
+            formatted_messages = prompt.format_messages(**prompt_inputs)
+            
+            # Log the full prompt
+            LOGGER.info("=" * 80)
+            LOGGER.info("PLANNER PROMPT - Full prompt sent to LLM:")
+            LOGGER.info("=" * 80)
+            for msg in formatted_messages:
+                role = msg.__class__.__name__
+                content = msg.content if hasattr(msg, "content") else str(msg)
+                LOGGER.info("\n[%s MESSAGE]", role.upper())
+                LOGGER.info("-" * 80)
+                # Handle both text-only (string) and multimodal (list) content
+                if isinstance(content, list):
+                    # Multimodal content: list of content blocks
+                    for idx, block in enumerate(content):
+                        if isinstance(block, dict):
+                            block_type = block.get("type", "unknown")
+                            if block_type == "text":
+                                LOGGER.info("Text block %d: %s", idx + 1, block.get("text", ""))
+                            elif block_type == "image_url":
+                                image_url = block.get("image_url", {})
+                                if isinstance(image_url, dict):
+                                    LOGGER.info("Image block %d: %s", idx + 1, image_url.get("url", ""))
+                                else:
+                                    LOGGER.info("Image block %d: %s", idx + 1, image_url)
+                            else:
+                                LOGGER.info("Content block %d (type=%s): %s", idx + 1, block_type, block)
+                        else:
+                            LOGGER.info("Content block %d: %s", idx + 1, block)
+                else:
+                    # Text-only content: simple string
+                    LOGGER.info("%s", content)
+                LOGGER.info("-" * 80)
+            LOGGER.info("=" * 80)
+            
+            # Store formatted prompt for UI display (handle multimodal)
+            prompt_parts = []
+            for msg in formatted_messages:
+                role = msg.__class__.__name__.upper()
+                content = msg.content if hasattr(msg, "content") else str(msg)
+                if isinstance(content, list):
+                    # Format multimodal content
+                    content_str = "\n".join([
+                        f"  [{idx+1}] {block.get('type', 'unknown')}: {block.get('text') or block.get('image_url', {}).get('url', '') if isinstance(block, dict) else block}"
+                        for idx, block in enumerate(content)
+                    ])
+                    prompt_parts.append(f"[{role}]\n{content_str}")
+                else:
+                    prompt_parts.append(f"[{role}]\n{content}")
+            formatted_prompt_text = "\n\n".join(prompt_parts)
+        except Exception as exc:  # noqa: BLE001
+            LOGGER.warning("Failed to format prompt for logging: %s", exc)
+            formatted_prompt_text = f"[Error formatting prompt: {exc}]"
+        
+        # Invoke with robust JSON handling: try strict parser first, then auto-fix
+        raw_planner_text = ""
+        try:
+            # Capture raw response first for diagnostics
+            raw_response = (prompt | llm).invoke(prompt_inputs)
+            raw_planner_text = getattr(raw_response, "content", str(raw_response)) or ""
+            LOGGER.debug("Planner raw LLM response (before parsing): %s", raw_planner_text[:500] if raw_planner_text else "<<empty>>")
+            if not raw_planner_text.strip():
+                LOGGER.warning("Planner LLM returned empty response. This may indicate a model compatibility issue.")
+            plan = parser.parse(raw_planner_text)
+        except Exception as parse_exc:
+            LOGGER.debug("Planner JSON parsing failed: %s. Raw response: %s", parse_exc, raw_planner_text[:500] if raw_planner_text else "<<empty>>")
+            # Fallback: attempt repair
+            try:
+                if not raw_planner_text:
+                    # Re-invoke if we don't have raw text yet
+                    raw_response = (prompt | llm).invoke(prompt_inputs)
+                    raw_planner_text = getattr(raw_response, "content", str(raw_response)) or ""
+                if raw_planner_text.strip():
+                    if OutputFixingParser is not None:
+                        fixing_parser = OutputFixingParser.from_llm(parser=parser, llm=llm)  # type: ignore[call-arg]
+                        plan = fixing_parser.parse(raw_planner_text)
+                    else:
+                        plan = _best_effort_json_repair(raw_planner_text)  # type: ignore[assignment]
+                else:
+                    LOGGER.warning("Planner LLM returned empty response after retry. Model may not support this prompt format.")
+                    plan = {"sql": "", "plan": {}, "rationale_summary": "", "tests": [], "summary": "", "followups": []}
+            except Exception as repair_exc:
+                LOGGER.warning("Planner JSON repair also failed: %s. Raw response: %s", repair_exc, raw_planner_text[:500] if raw_planner_text else "<<empty>>")
+                plan = {"sql": "", "plan": {}, "rationale_summary": "", "tests": [], "summary": "", "followups": []}
         if isinstance(plan, dict):
             sql_statements = plan.get("sql")
-            if not sql_statements and plan.get("rationale"):
-                plan["sql_generation_note"] = "LLM provided a rationale but no SQL."
+            if not sql_statements:
+                # Log raw response for debugging when SQL is empty
+                if raw_planner_text:
+                    LOGGER.info("Planner returned empty SQL. Raw LLM response: %s", raw_planner_text[:1000])
+                else:
+                    LOGGER.warning("Planner returned empty SQL and no raw response was captured. Model may have failed silently.")
+                # Planner failed to produce SQL; bootstrap a minimal SQL using the repair prompt
+                LOGGER.info("Planner returned no SQL. Bootstrapping baseline SQL from Graph Context.")
+                try:
+                    bootstrap_chain = REPAIR_PROMPT | llm | JsonOutputParser()
+                    graph_text = state.get("schema_markdown", "")
+                    result = _safe_invoke_json(
+                        bootstrap_chain,
+                        {
+                            "dialect": state.get("dialect", ""),
+                            "graph": graph_text,
+                            "sql": "",
+                            "error": "Planner produced no SQL; synthesize a minimal, correct SQL answering the question from Graph Context and analysis hints.",
+                            "repair_hints": [
+                                "Use FK paths from RELATIONSHIP_MAP to join necessary tables",
+                                "Select explicit columns, no SELECT *",
+                                "Apply GROUP BY/COUNT and ORDER BY DESC with row cap per dialect",
+                            ],
+                            "plan": {"note": "bootstrap from question and graph"},
+                        },
+                        llm,
+                    )
+                    bootstrap_raw = result.get("__raw", "")
+                    if bootstrap_raw:
+                        LOGGER.debug("Bootstrap raw LLM response: %s", bootstrap_raw[:500])
+                    patched_sql = result.get("patched_sql") or ""
+                    if patched_sql.strip():
+                        plan["sql"] = patched_sql
+                        plan.setdefault("notes", []).append("Bootstrapped baseline SQL due to empty planner output.")
+                        LOGGER.debug("Bootstrapped SQL: %s", patched_sql)
+                    else:
+                        if bootstrap_raw:
+                            LOGGER.warning("Bootstrap returned empty patched_sql. Raw response: %s", bootstrap_raw[:1000])
+                        else:
+                            LOGGER.warning("Bootstrap returned empty patched_sql and no raw response captured.")
+                        plan["sql_generation_note"] = "Planner returned no SQL and bootstrap produced no patch."
+                        # Surface a clear error for routing to fail node
+                        state["execution_error"] = "Planner failed to produce SQL, and bootstrap also returned no patch."
+                except Exception as e:
+                    LOGGER.debug("Bootstrap baseline SQL failed: %s", e)
+                    plan["sql_generation_note"] = "Planner returned no SQL and bootstrap failed."
+                    state["execution_error"] = "Planner failed to produce SQL, and bootstrap failed."
             else:
                 plan = _post_process_plan(plan, state)
             LOGGER.debug("LLM plan: %s", plan)
         return {
             "plan": plan,
             "prompt_inputs": prompt_inputs,
+            "formatted_prompt": formatted_prompt_text,  # Store for UI
             "critic": {},
             "repair_attempts": 0,
             "intent_critic": {},
@@ -226,6 +697,8 @@ def _intent_critic(llm: Any):
     chain = INTENT_CRITIC_PROMPT | llm | parser
 
     def node(state: QueryState) -> QueryState:
+        attempts = state.get("intent_attempts", 0)
+        LOGGER.info("Intent critic iteration %d/%d (MAX)", attempts + 1, MAX_INTENT_REPAIRS)
         plan = state.get("plan") or {}
         sql = plan.get("sql")
         if isinstance(sql, list):
@@ -233,14 +706,39 @@ def _intent_critic(llm: Any):
         else:
             sql_text = sql or ""
         plan_summary = plan.get("plan") or {}
-        result = chain.invoke(
+        graph_text = state.get("schema_markdown", "")
+        result = _safe_invoke_json(
+            chain,
             {
+                "dialect": state.get("dialect", ""),
+                "graph": graph_text,
                 "question": state.get("question", ""),
                 "plan": plan_summary,
                 "sql": sql_text,
-            }
+            },
+            llm,
         )
-        LOGGER.debug("Intent critic verdict: %s", result)
+        LOGGER.info("Intent critic iteration %d verdict: %s", attempts + 1, result.get("verdict"))
+        if result.get("reasons"):
+            LOGGER.info("Intent critic reasons: %s", result.get("reasons"))
+        if result.get("repair_hints"):
+            LOGGER.info("Intent critic repair_hints: %s", result.get("repair_hints"))
+        if not (result.get("reasons") or result.get("repair_hints")):
+            raw = result.get("__raw")
+            if raw:
+                LOGGER.info("Intent critic returned empty reasons/hints. Raw response: %s", raw)
+        # Visualization-only complaints should not block execution
+        try:
+            reasons = [str(r).lower() for r in (result.get("reasons") or [])]
+            hints = [str(h).lower() for h in (result.get("repair_hints") or [])]
+            viz_keywords = ("chart", "visualization", "pie chart")
+            only_viz_reasons = bool(reasons) and all(any(k in r for k in viz_keywords) for r in reasons)
+            only_viz_hints = bool(hints) and all(any(k in h for k in viz_keywords) for h in hints)
+            if (result.get("verdict") or "").lower() == "reject" and (only_viz_reasons or only_viz_hints):
+                LOGGER.info("Intent critic: overriding reject to accept (visualization-only complaints).")
+                result = {"verdict": "accept", "reasons": [], "repair_hints": []}
+        except Exception:  # pragma: no cover
+            pass
         state["intent_critic"] = result
         # Clear any previous execution error when we are re-evaluating intent
         state.pop("execution_error", None)
@@ -254,6 +752,10 @@ def _intent_repair(llm: Any):
     chain = REPAIR_PROMPT | llm | parser
 
     def node(state: QueryState) -> QueryState:
+        attempts = state.get("intent_attempts", 0)
+        if attempts >= MAX_INTENT_REPAIRS:
+            LOGGER.info("Reached MAX intent repair iterations (%d). Skipping further repair.", MAX_INTENT_REPAIRS)
+            return state
         plan = state.get("plan") or {}
         sql = plan.get("sql")
         if isinstance(sql, list):
@@ -261,24 +763,30 @@ def _intent_repair(llm: Any):
         else:
             sql_text = sql or ""
         critic = state.get("intent_critic") or {}
-        attempts = state.get("intent_attempts", 0)
         error_text = "; ".join(critic.get("reasons", []))
-        result = chain.invoke(
+        graph_text = state.get("schema_markdown", "")
+        result = _safe_invoke_json(
+            chain,
             {
                 "dialect": state.get("dialect", ""),
+                "graph": graph_text,
                 "sql": sql_text,
                 "error": error_text,
                 "repair_hints": critic.get("repair_hints", []),
-            }
+                "plan": plan.get("plan") or {},
+            },
+            llm,
         )
-        LOGGER.debug("Intent repair attempt %s: %s", attempts + 1, result)
+        LOGGER.info("Intent repair attempt %d result received", attempts + 1)
         patched_sql = result.get("patched_sql")
-        if patched_sql:
+        if patched_sql and patched_sql.strip() and patched_sql.strip() != sql_text.strip():
             plan["sql"] = patched_sql
             plan.setdefault("notes", []).append(
                 f"Intent repair iteration {attempts + 1} applied."
             )
             state["plan"] = plan
+        else:
+            LOGGER.info("Intent repair attempt %d produced no effective change", attempts + 1)
         state["intent_attempts"] = attempts + 1
         state["intent_critic"] = {}
         state.pop("execution_error", None)
@@ -291,6 +799,36 @@ def _execute_sql(engine: Engine):
     def node(state: QueryState) -> QueryState:
         plan = state["plan"]
         sql_statements = plan.get("sql")
+        
+        # Log the final SQL and prompt that will be used for execution (after all intent critic/repair iterations)
+        LOGGER.info("=" * 80)
+        LOGGER.info("FINAL PROMPT & SQL BEFORE EXECUTION (after all intent critic/repair iterations):")
+        LOGGER.info("=" * 80)
+        intent_attempts = state.get("intent_attempts", 0)
+        if intent_attempts > 0:
+            LOGGER.info("Intent repair attempts: %d", intent_attempts)
+        
+        # Re-print the full prompt that was used to generate this SQL
+        formatted_prompt = state.get("formatted_prompt")
+        if formatted_prompt:
+            LOGGER.info("\n[FULL PLANNER PROMPT - This is what generated the SQL below]")
+            LOGGER.info("-" * 80)
+            LOGGER.info("%s", formatted_prompt)
+            LOGGER.info("-" * 80)
+        
+        # Log the final SQL that will be executed
+        LOGGER.info("\n[FINAL SQL TO EXECUTE - After all intent repairs]")
+        LOGGER.info("-" * 80)
+        if isinstance(sql_statements, str):
+            LOGGER.info("%s", sql_statements)
+        elif isinstance(sql_statements, list):
+            for idx, sql in enumerate(sql_statements, 1):
+                LOGGER.info("\n-- Statement %d:\n%s", idx, sql)
+        else:
+            LOGGER.info("No SQL statements found in plan")
+        LOGGER.info("-" * 80)
+        LOGGER.info("=" * 80)
+        
         executions: List[ExecutionResult] = []
         if isinstance(sql_statements, str):
             sql_statements = [sql_statements]
@@ -315,6 +853,35 @@ def _execute_sql(engine: Engine):
         sensitive_columns: Sequence[str] = []
         if isinstance(graph, GraphContext):
             sensitive_columns = graph.sensitive_columns
+
+        # Sanitize away non-data/probe statements (e.g., SELECT 'pie' FROM dual)
+        if isinstance(sql_statements, list):
+            original_len = len(sql_statements)
+            sql_statements = _sanitize_sql_list(sql_statements)
+            if len(sql_statements) != original_len:
+                LOGGER.info("Sanitized SQL list: removed %d non-data statement(s)", original_len - len(sql_statements))
+
+        # Transpile SQL to target dialect if needed (safety net in case LLM generated wrong dialect)
+        target_dialect = state.get("dialect") or ""
+        for idx, sql in enumerate(sql_statements):
+            transpiled_sql, was_transpiled = transpile_sql(sql, target_dialect=target_dialect)
+            if was_transpiled:
+                sql_statements[idx] = transpiled_sql
+                LOGGER.info("Transpiled SQL statement %d to %s dialect", idx + 1, target_dialect)
+
+        # First, attempt to repair unknown/misspelled columns in a schema-aware way
+        for idx, sql in enumerate(sql_statements):
+            repaired = _repair_unknown_columns(sql, graph)
+            if repaired != sql:
+                sql_statements[idx] = repaired
+                LOGGER.info("Repaired unknown column names in statement %d based on schema context", idx + 1)
+
+        # Schema-aware alias normalization to fix common qualifier mistakes
+        for idx, sql in enumerate(sql_statements):
+            normalized = _remap_missing_columns(sql, graph)
+            if normalized != sql:
+                sql_statements[idx] = normalized
+                LOGGER.info("Normalized column qualifiers in statement %d based on schema context", idx + 1)
 
         for idx, sql in enumerate(sql_statements):
             if isinstance(graph, GraphContext):
@@ -392,11 +959,21 @@ def _execute_sql(engine: Engine):
             plan["sql"] = sql_statements[0] if sql_statements else plan.get("sql")
         else:
             plan["sql"] = sql_statements
+        
+        # Update final SQL text after all processing (validation, repair, etc.)
+        if isinstance(sql_statements, str):
+            final_sql_text = sql_statements
+        elif isinstance(sql_statements, list) and sql_statements:
+            final_sql_text = "\n\n".join(f"-- Statement {idx}\n{sql}" for idx, sql in enumerate(sql_statements, 1))
+        else:
+            final_sql_text = ""
+        
         return {
             "executions": executions,
             "plan": plan,
             "execution_error": execution_error,
             "executions_available": True,
+            "final_sql": final_sql_text,  # Final SQL that was executed (after all repairs)
         }
 
     return node
@@ -509,6 +1086,7 @@ def _post_process_plan(plan: Dict[str, Any], state: QueryState) -> Dict[str, Any
     changed = False
     applied_all_tables_note = False
     used_columns_override = False
+    qualification_applied = False
     for sql in sql_list:
         sql_text = sql
         lower_sql = sql.lower()
@@ -552,6 +1130,25 @@ def _post_process_plan(plan: Dict[str, Any], state: QueryState) -> Dict[str, Any
             changed = True
             used_columns_override = True
 
+    # Ensure tables are qualified with the default schema (if configured)
+    graph_context = state.get("graph_context")
+    known_tables: Set[str] = set()
+    if isinstance(graph_context, GraphContext):
+        known_tables = {card.name.lower() for card in graph_context.tables}
+    if schema_name and adjusted:
+        qualified_sqls = []
+        for sql_text in adjusted:
+            qualified_sql, qualified = _ensure_schema_qualification(
+                sql_text,
+                schema_name,
+                known_tables,
+            )
+            if qualified:
+                changed = True
+                qualification_applied = True
+            qualified_sqls.append(qualified_sql)
+        adjusted = qualified_sqls
+
     if isinstance(sql_statements, str):
         plan["sql"] = adjusted[0]
     else:
@@ -567,8 +1164,54 @@ def _post_process_plan(plan: Dict[str, Any], state: QueryState) -> Dict[str, Any
         note = "Replaced plan with column metadata query using ALL_TAB_COLUMNS."
         if note not in notes:
             notes.append(note)
+    if qualification_applied:
+        note = f"Auto-qualified tables with schema {schema_name}."
+        if note not in notes:
+            notes.append(note)
 
     return plan
+
+
+def _ensure_schema_qualification(
+    sql_text: str,
+    schema_name: str,
+    known_tables: Set[str],
+) -> Tuple[str, bool]:
+    """
+    Ensure all table references are qualified with the default schema.
+    Only applies to tables that are part of the known graph context.
+    """
+    if not schema_name:
+        return sql_text, False
+    try:
+        ast = sqlglot.parse_one(sql_text, read=None)
+    except Exception:
+        return sql_text, False
+
+    cte_names: Set[str] = set()
+    for cte in ast.find_all(exp.CTE):
+        alias = getattr(getattr(cte, "alias", None), "name", None)
+        name = alias or getattr(getattr(cte, "this", None), "name", None)
+        if name:
+            cte_names.add(name.lower())
+
+    changed = False
+    for table in ast.find_all(exp.Table):
+        if table.args.get("db"):
+            continue
+        identifier = getattr(table, "this", None)
+        if not isinstance(identifier, exp.Identifier):
+            continue
+        table_name = (identifier.name or "").lower()
+        if not table_name:
+            continue
+        if table_name in cte_names:
+            continue
+        if known_tables and table_name not in known_tables:
+            continue
+        table.set("db", exp.to_identifier(schema_name))
+        changed = True
+    return (ast.sql() if changed else sql_text), changed
 
 
 def _metadata_fallback(state: QueryState) -> Optional[List[str]]:
@@ -662,7 +1305,8 @@ def _needs_critique(state: QueryState) -> bool:
 def _needs_repair(state: QueryState) -> bool:
     critic = state.get("critic") or {}
     attempts = state.get("repair_attempts", 0)
-    if attempts >= 3:
+    if attempts >= MAX_INTENT_REPAIRS:
+        LOGGER.info("Post-exec repair: reached MAX iterations (%d). Stopping repair loop.", MAX_INTENT_REPAIRS)
         return False
     return critic.get("verdict") == "reject"
 
@@ -672,6 +1316,7 @@ def _critic_sql(llm: Any):
     chain = CRITIC_PROMPT | llm | parser
 
     def node(state: QueryState) -> QueryState:
+        attempts = state.get("repair_attempts", 0)
         plan = state.get("plan") or {}
         sql = plan.get("sql")
         if isinstance(sql, list):
@@ -682,14 +1327,27 @@ def _critic_sql(llm: Any):
             "steps": plan.get("plan", {}).get("steps", []),
             "notes": plan.get("plan", {}).get("notes", []),
         }
-        result = chain.invoke(
+        graph_text = state.get("schema_markdown", "")
+        result = _safe_invoke_json(
+            chain,
             {
+                "dialect": state.get("dialect", ""),
+                "graph": graph_text,
                 "sql": sql_text,
                 "plan": plan_summary,
                 "error": state.get("execution_error", ""),
-            }
+            },
+            llm,
         )
-        LOGGER.debug("SQL critic verdict: %s", result)
+        LOGGER.info("Post-exec critic iteration %d/%d (MAX) verdict: %s", attempts + 1, MAX_INTENT_REPAIRS, result.get("verdict"))
+        if result.get("reasons"):
+            LOGGER.info("Post-exec critic reasons: %s", result.get("reasons"))
+        if result.get("repair_hints"):
+            LOGGER.info("Post-exec critic repair_hints: %s", result.get("repair_hints"))
+        if not (result.get("reasons") or result.get("repair_hints")):
+            raw = result.get("__raw")
+            if raw:
+                LOGGER.info("Post-exec critic returned empty reasons/hints. Raw response: %s", raw)
         state["critic"] = result
         return state
 
@@ -709,22 +1367,36 @@ def _repair_sql(llm: Any):
             sql_text = sql or ""
         critic = state.get("critic") or {}
         attempts = state.get("repair_attempts", 0)
-        result = chain.invoke(
+        result = _safe_invoke_json(
+            chain,
             {
                 "dialect": state.get("dialect", ""),
+                "graph": state.get("schema_markdown", ""),
                 "sql": sql_text,
                 "error": state.get("execution_error", ""),
                 "repair_hints": critic.get("repair_hints", []),
                 "plan": plan,
-            }
+            },
+            llm,
         )
-        LOGGER.debug("SQL repair attempt %s: %s", attempts + 1, result)
+        LOGGER.info("Post-exec repair attempt %d/%d (MAX) result received", attempts + 1, MAX_INTENT_REPAIRS)
         patched_sql = result.get("patched_sql")
+        what_changed = result.get("what_changed")
+        why_changed = result.get("why")
+        if what_changed:
+            LOGGER.info("Post-exec repair what_changed: %s", what_changed)
+        if why_changed:
+            LOGGER.info("Post-exec repair why: %s", why_changed)
+        if not patched_sql:
+            raw = result.get("__raw")
+            if raw:
+                LOGGER.info("Post-exec repair returned no patched_sql. Raw response: %s", raw)
         if patched_sql:
             plan["sql"] = patched_sql
             plan.setdefault("notes", []).append(
                 f"Applied repair iteration {attempts + 1}."
             )
+            LOGGER.debug("Patched SQL (iteration %d): %s", attempts + 1, patched_sql)
         state["plan"] = plan
         state["repair_attempts"] = attempts + 1
         state.pop("execution_error", None)

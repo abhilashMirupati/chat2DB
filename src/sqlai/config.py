@@ -9,13 +9,15 @@ from pathlib import Path
 from typing import Literal, Optional
 
 from pydantic import Field, validator
-from pydantic_settings import BaseSettings
+from pydantic_settings import BaseSettings, SettingsConfigDict
 
 
 class DatabaseConfig(BaseSettings):
     """
     Settings required to connect to any SQL database supported by SQLAlchemy.
     """
+
+    model_config = SettingsConfigDict(extra="ignore")
 
     url: str = Field(..., description="SQLAlchemy connection string.")
     schema: Optional[str] = Field(
@@ -45,16 +47,20 @@ class DatabaseConfig(BaseSettings):
         description="Include database system tables in schema summaries.",
     )
 
-    class Config:
-        env_prefix = "SQLAI_DB_"
-        env_file = ".env"
-        env_file_encoding = "utf-8"
+    model_config = SettingsConfigDict(
+        env_prefix="SQLAI_DB_",
+        env_file=".env",
+        env_file_encoding="utf-8",
+        extra="ignore",
+    )
 
 
 class LLMConfig(BaseSettings):
     """
     Settings for the large language model provider.
     """
+
+    model_config = SettingsConfigDict(extra="ignore")
 
     provider: Literal["openai", "anthropic", "ollama", "huggingface", "azure_openai"] = Field(
         default="ollama",
@@ -71,10 +77,12 @@ class LLMConfig(BaseSettings):
     )
     max_output_tokens: int = Field(default=1_024, description="Maximum tokens for responses.")
 
-    class Config:
-        env_prefix = "SQLAI_LLM_"
-        env_file = ".env"
-        env_file_encoding = "utf-8"
+    model_config = SettingsConfigDict(
+        env_prefix="SQLAI_LLM_",
+        env_file=".env",
+        env_file_encoding="utf-8",
+        extra="ignore",
+    )
 
     @validator("api_key", always=True)
     def validate_api_key(cls, value: Optional[str], values: dict[str, str]) -> Optional[str]:
@@ -89,19 +97,27 @@ class EmbeddingConfig(BaseSettings):
     Settings for the embedding provider used in graph retrieval.
     """
 
-    provider: Literal["none", "huggingface", "ollama"] = Field(
-        default="none", description="Embedding provider to use for semantic retrieval."
+    model_config = SettingsConfigDict(extra="ignore")
+
+    provider: Literal["huggingface", "ollama"] = Field(
+        default="huggingface",
+        description="Embedding provider to use for semantic retrieval.",
     )
-    model: Optional[str] = Field(default=None, description="Embedding model identifier.")
+    model: Optional[str] = Field(
+        default="google/embeddinggemma-300m",
+        description="Embedding model identifier.",
+    )
     base_url: Optional[str] = Field(
         default=None, description="Optional base URL for self-hosted embedding providers."
     )
     api_key: Optional[str] = Field(default=None, description="API key for hosted providers.")
 
-    class Config:
-        env_prefix = "SQLAI_EMBED_"
-        env_file = ".env"
-        env_file_encoding = "utf-8"
+    model_config = SettingsConfigDict(
+        env_prefix="SQLAI_EMBED_",
+        env_file=".env",
+        env_file_encoding="utf-8",
+        extra="ignore",
+    )
 
     @validator("api_key", always=True)
     def validate_embed_api_key(cls, value: Optional[str], values: dict[str, str]) -> Optional[str]:
@@ -111,10 +127,40 @@ class EmbeddingConfig(BaseSettings):
         return value
 
 
+class VectorStoreConfig(BaseSettings):
+    """
+    Settings for persisted vector store used to cache graph card embeddings.
+    """
+
+    model_config = SettingsConfigDict(extra="ignore")
+
+    provider: Literal["chroma"] = Field(
+        default="chroma",
+        description="Vector store provider for persisted embeddings.",
+    )
+    path: Optional[Path] = Field(
+        default=None,
+        description="Directory for vector store persistence (defaults to cache_dir/vector_store).",
+    )
+    collection: str = Field(
+        default="graph_cards",
+        description="Collection name used within the vector store backend.",
+    )
+
+    model_config = SettingsConfigDict(
+        env_prefix="SQLAI_VECTOR_",
+        env_file=".env",
+        env_file_encoding="utf-8",
+        extra="ignore",
+    )
+
+
 class AppConfig(BaseSettings):
     """
     Top-level settings for application behaviour.
     """
+
+    model_config = SettingsConfigDict(extra="ignore")
 
     project_root: Path = Field(default_factory=lambda: Path(__file__).resolve().parents[2])
     cache_dir: Path = Field(default_factory=lambda: Path(".cache"))
@@ -126,10 +172,12 @@ class AppConfig(BaseSettings):
         description="Path to a logo image displayed in the UI sidebar.",
     )
 
-    class Config:
-        env_prefix = "SQLAI_"
-        env_file = ".env"
-        env_file_encoding = "utf-8"
+    model_config = SettingsConfigDict(
+        env_prefix="SQLAI_",
+        env_file=".env",
+        env_file_encoding="utf-8",
+        extra="ignore",
+    )
 
     @validator("brand_logo_path", pre=True)
     def _validate_logo(cls, value: Optional[str]) -> Optional[Path]:
@@ -155,6 +203,11 @@ def load_llm_config() -> LLMConfig:
 @lru_cache()
 def load_embedding_config() -> EmbeddingConfig:
     return EmbeddingConfig()
+
+
+@lru_cache()
+def load_vector_store_config() -> VectorStoreConfig:
+    return VectorStoreConfig()
 
 
 @lru_cache()

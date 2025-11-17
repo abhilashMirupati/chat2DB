@@ -26,7 +26,7 @@ class TableCard:
             lines.append(f"  comment: {self.comment}")
         column_desc = ", ".join(
             f"{col.name} ({col.type}{', nullable' if col.nullable else ''})"
-            for col in self.columns[:12]
+            for col in self.columns
         )
         if column_desc:
             lines.append(f"  columns: {column_desc}")
@@ -115,9 +115,11 @@ class GraphContext:
         columns: Optional[List[ColumnCard]] = None,
         relationships: Optional[List[RelationshipCard]] = None,
     ) -> Dict[str, str]:
-        selected_tables = tables or self.rank_tables(question, max_cards=6)
-        selected_columns = columns or self.rank_columns(question, selected_tables, max_cards=10)
-        selected_relationships = relationships or self.relationships_for_tables(selected_tables)
+        # Use provided tables/columns/relationships if given, otherwise fall back to ranking
+        # Note: Check for None explicitly (not just truthiness) to allow empty lists
+        selected_tables = tables if tables is not None else self.rank_tables(question, max_cards=6)
+        selected_columns = columns if columns is not None else self.rank_columns(question, selected_tables, max_cards=10)
+        selected_relationships = relationships if relationships is not None else self.relationships_for_tables(selected_tables)
 
         schema_names = ", ".join(sorted(filter(None, self.schemas))) or "(not specified)"
         table_cards_text = "\n\n".join(card.render() for card in selected_tables) or "None"
@@ -125,6 +127,22 @@ class GraphContext:
         column_facts_text = "\n".join(card.fact() for card in selected_columns) or "None"
         relationship_map_text = "\n".join(rel.render() for rel in selected_relationships) or "None"
         value_anchor_text = "No value anchors collected."
+        
+        # Log what's being included in the prompt for verification
+        from sqlai.utils.logging import get_logger
+        logger = get_logger(__name__)
+        logger.info("Prompt context summary: %d tables, %d columns, %d relationships", 
+                   len(selected_tables), len(selected_columns), len(selected_relationships))
+        logger.debug("Table cards text length: %d chars", len(table_cards_text))
+        logger.debug("Column cards text length: %d chars", len(column_cards_text))
+        logger.debug("Relationship map text length: %d chars", len(relationship_map_text))
+        # Log a sample to verify content is present
+        if table_cards_text and table_cards_text != "None":
+            logger.debug("Table cards sample (first 200 chars): %s", table_cards_text[:200])
+        if column_cards_text and column_cards_text != "None":
+            logger.debug("Column cards sample (first 200 chars): %s", column_cards_text[:200])
+        if relationship_map_text and relationship_map_text != "None":
+            logger.debug("Relationship map sample (first 200 chars): %s", relationship_map_text[:200])
 
         prompt = {
             "dialect_guide": dialect_guide,
@@ -256,7 +274,7 @@ class GraphContext:
             for rel in self.relationships
             if rel.table in table_names or rel.detail.referred_table in table_names
         ]
-        return rels[:8]
+        return rels  # Return ALL relationships, no truncation
 
 
 def build_graph_context(

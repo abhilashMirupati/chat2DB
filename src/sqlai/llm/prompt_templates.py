@@ -1,5 +1,17 @@
 """
 Prompt templates for guiding SQL reasoning.
+
+Note: These templates send text content as strings, which works for:
+- Text-only models (e.g., llama-3-sqlcoder-8b): ✓
+- Multimodal models (e.g., Qwen3-VL-8B-Instruct): ✓ (text-only mode)
+
+Both model types work correctly for text-to-text SQL generation. LangChain's
+ChatOpenAI automatically formats string content correctly for both model types.
+
+If you want to extend to multimodal (text + images) in the future:
+- Extend the prompt templates to accept image content
+- Pass multimodal content in the format: [{"type": "text", "text": "..."}, {"type": "image_url", "image_url": {"url": "..."}}]
+- LangChain will automatically format it correctly for the OpenAI-compatible API
 """
 
 from __future__ import annotations
@@ -38,6 +50,14 @@ Graph-RAG fixes this by giving you:
 - Prefer joins that match RELATIONSHIP_MAP; avoid cartesian joins.
 - Stay within the token/row budget; never expose columns marked sensitive.
 - Follow the DIALECT_GUIDE exactly (quoting, pagination/limit, date functions, case-sensitivity).
+
+[PLANNING & SQL CONSTRUCTION — STRICT GOOD PRACTICES]
+- Ground every referenced column to its owning table using the Graph Context (TABLE/COLUMN cards). If a column is not on a joined table, add the required JOIN using the FK path from RELATIONSHIP_MAP.
+- Build an explicit alias → table map and ensure every alias.column exists in that table's column list.
+- Use FK-declared joins from RELATIONSHIP_MAP (shortest chain that answers the question). Avoid ad-hoc or cartesian joins.
+- **Schema qualification**: When a default schema is set (see SESSION HINTS), use fully qualified table names (e.g., `AGENT_DEMO.test_sets`) in FROM/JOIN clauses to avoid ambiguity. This is especially important for Oracle databases. Match the exact format shown in TABLE CARDS (e.g., "AGENT_DEMO.test_sets" if the card shows "AGENT_DEMO.test_sets").
+- Produce a single data-producing SQL (or a small list when truly necessary). Do NOT include non-data "probe" statements (e.g., SELECT 'pie' FROM dual) or chart-related placeholders.
+- If the question mentions charts, still output only the SQL; the UI handles visualization.
 
 [INPUTS YOU WILL RECEIVE (FILLED BY ORCHESTRATOR)]
 - DIALECT_GUIDE: concrete rules for the target engine (e.g., Oracle vs Postgres).
@@ -122,38 +142,75 @@ Produce strict JSON with the fields:
 - chart (optional object with type/x/y/options)
 
 Do not include any prose outside the JSON object.
+Return strict JSON only: use double quotes, no trailing commas, no comments.
 """
 
 INTENT_CRITIC_PROMPT = ChatPromptTemplate.from_messages([
     (
         "system",
-        "You are a SQL intent critic. Given a natural language question, the proposed SQL plan, and the SQL itself, decide whether the SQL answers the question faithfully using only authorised tables. Return JSON with keys verdict ('accept' or 'reject'), reasons (array of strings explaining issues), and repair_hints (array of short suggestions).",
+        "You are a universal SQL intent critic. Input: user question, plan summary, candidate SQL, dialect guide, and Graph Context (tables, columns, FK paths). Task: decide if the SQL correctly answers the question.\n"
+        "- Validate against Graph Context: only existing tables/columns, correct aliases, FK-aligned joins, no cartesian joins.\n"
+        "- Validate semantics: SELECT/GROUP BY/aggregations match the question intent; filters align with value anchors or examples.\n"
+        "- Validate dialect: quoting, pagination (LIMIT vs FETCH), date/time/literal syntax per DIALECT_GUIDE.\n"
+        "- Validate safety: respect row caps, no sensitive columns, avoid SELECT *.\n"
+        "- Ignore visualization/chart requests when judging SQL; charts are handled outside SQL.\n"
+        "- Reject and remove any non-data 'probe' statements (e.g., SELECT 'pie' FROM dual) that are unrelated to answering the question.\n"
+        "- Use the Graph Context thoroughly: enumerate which table and column each referenced alias maps to; verify existence against the column lists; trace FK paths for every JOIN.\n"
+        "- Pinpoint issues precisely: cite the exact alias.table.column that is invalid or misplaced and the exact FK path that should be used.\n"
+        "Return strict JSON with keys:\n"
+        '  "verdict": "accept" | "reject",\n'
+        '  "reasons": [string...],  // concise issues, each naming alias.table.column and/or FK path\n'
+        '  "repair_hints": [string...] // precise, actionable hints (e.g., "JOIN agent_demo.executions e ON e.test_case_id = tc.id; move filter to e.status", "use FETCH FIRST n ROWS ONLY")\n'
+        "Return strict JSON: use double quotes only, no trailing commas, no comments.",
     ),
     (
         "human",
-        "Question:\n{question}\n\nPlan summary:\n{plan}\n\nSQL:\n{sql}\n\nReturn JSON.",
+        "Dialect:\n{dialect}\n\nGraph Context:\n{graph}\n\nQuestion:\n{question}\n\nPlan summary:\n{plan}\n\nSQL:\n{sql}\n\nReturn JSON.",
     ),
 ])
 
 CRITIC_PROMPT = ChatPromptTemplate.from_messages([
     (
         "system",
-        "You are a SQL gatekeeper. Given SQL, the plan, and the database error, decide if the SQL is acceptable. If not, highlight issues and suggest concise repair hints. Respond in JSON with keys verdict (accept or reject), reasons (array), and repair_hints (array).",
+        "You are a universal SQL gatekeeper. Input: SQL, plan summary, database error (if any), Graph Context, and dialect guide. Task: decide if SQL is acceptable, otherwise provide focused repair hints.\n"
+        "- Check schema correctness (tables/columns/aliases), FK joins, cartesian avoidance.\n"
+        "- Check dialect compliance and pagination rules.\n"
+        "- Use the error message to pinpoint the failing clause.\n"
+        "- Ignore visualization/chart requests when judging SQL; charts are handled outside SQL.\n"
+        "- Reject and remove any non-data 'probe' statements (e.g., SELECT 'pie' FROM dual) that are unrelated to answering the question.\n"
+        "- Use the Graph Context thoroughly: map aliases → tables; verify alias.table.column existence; identify the correct FK join path that should be used.\n"
+        "- Provide specific, schema-grounded hints that name the exact alias.table.column to fix and the exact JOIN to add or adjust.\n"
+        "Return strict JSON with keys:\n"
+        '  "verdict": "accept" | "reject",\n'
+        '  "reasons": [string...],  // each reason should reference exact alias.table.column and/or FK path\n'
+        '  "repair_hints": [string...]  // each hint should be an explicit edit: JOIN to add, alias to qualify, column to move\n'
+        "Return strict JSON: use double quotes only, no trailing commas, no comments.",
     ),
     (
         "human",
-        "SQL:\n{sql}\n\nPlan summary:\n{plan}\n\nExecution error:\n{error}\n\nReturn JSON."
+        "Dialect:\n{dialect}\n\nGraph Context:\n{graph}\n\nSQL:\n{sql}\n\nPlan summary:\n{plan}\n\nExecution error:\n{error}\n\nReturn JSON."
     )
 ])
 
 REPAIR_PROMPT = ChatPromptTemplate.from_messages([
     (
         "system",
-        "You repair SQL for the given dialect using the provided error and hints. Output JSON with patched_sql (string), what_changed (array), and why (string).",
+        "You are a universal SQL repairer. Using dialect guide, Graph Context (tables/columns/FK paths), the original SQL, and the critic's hints/error message, produce a minimally changed corrected SQL that answers the question.\n"
+        "- You MAY make structural changes if required (e.g., add/remove JOINs that are present in Graph Context via FK paths; fix aliases; move filters to the correct table; adjust GROUP BY/aggregations).\n"
+        "- Prefer the shortest FK chain; avoid cartesian joins; respect row caps and dialect rules.\n"
+        "- Remove any chart/visualization 'probe' statements (e.g., SELECT 'pie' FROM dual) and keep only the data-producing SQL needed to answer the question.\n"
+        "- Use the critic's hints as exact instructions: add the named JOIN(s), move the named filter(s) to the correct alias.table.column, and ensure all referenced columns exist per Graph Context.\n"
+        "- Before returning, double-check each alias.table.column against the Graph Context's column lists and each JOIN against the FK paths; if any still mismatches, correct it.\n"
+        "- Keep the patch as small as possible while making the SQL correct.\n"
+        "Return strict JSON with:\n"
+        '  "patched_sql": string,\n'
+        '  "what_changed": [string...],\n'
+        '  "why": string\n'
+        "Return strict JSON: use double quotes only, no trailing commas, no comments.",
     ),
     (
         "human",
-        "Dialect: {dialect}\nOriginal SQL:\n{sql}\n\nError:\n{error}\n\nHints:\n{repair_hints}\n\nReturn JSON."
+        "Dialect:\n{dialect}\n\nGraph Context:\n{graph}\n\nOriginal SQL:\n{sql}\n\nError:\n{error}\n\nHints:\n{repair_hints}\n\nPlan summary (optional):\n{plan}\n\nReturn JSON."
     )
 ])
 

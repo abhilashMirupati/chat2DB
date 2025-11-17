@@ -93,8 +93,8 @@ def init_session_state() -> None:
         "service_initialised": False,
         "available_schemas": [],
         "schema_select_option": "(current schema)",
-        "embedding_provider": "none",
-        "embedding_model": "",
+        "embedding_provider": "huggingface",
+        "embedding_model": "google/embeddinggemma-300m",
         "embedding_base_url": "",
         "embedding_api_key": "",
         "embedding_status": None,
@@ -144,8 +144,10 @@ def _update_inputs_from_profile(profile_name: str) -> None:
             "include_system_tables": profile.get("include_system_tables", False),
             "available_schemas": [],
             "schema_select_option": "(current schema)",
-            "embedding_provider": profile.get("embedding_provider", "none"),
-            "embedding_model": profile.get("embedding_model", ""),
+            "embedding_provider": (
+                profile.get("embedding_provider") if profile.get("embedding_provider") not in {"", "none", None} else "huggingface"
+            ),
+            "embedding_model": profile.get("embedding_model", "google/embeddinggemma-300m"),
             "embedding_base_url": profile.get("embedding_base_url", ""),
             "embedding_api_key": profile.get("embedding_api_key", ""),
             "embedding_status": None,
@@ -204,9 +206,9 @@ def _validate_llm_inputs(
 
 
 def _validate_embedding_inputs(provider: str, model: str | None, api_key: str | None) -> Optional[str]:
-    provider_key = (provider or "none").lower()
-    if provider_key in {"", "none"}:
-        return None
+    if not provider or not provider.strip():
+        return "Embedding provider is required."
+    provider_key = provider.lower()
     if not model or not model.strip():
         return "Embedding model is required for the selected provider."
     if provider_key == "huggingface" and not api_key:
@@ -249,8 +251,8 @@ def sidebar_configuration() -> None:
                     "service_initialised": False,
                     "available_schemas": [],
                     "schema_select_option": "(current schema)",
-                    "embedding_provider": "none",
-                    "embedding_model": "",
+                    "embedding_provider": "huggingface",
+                    "embedding_model": "google/embeddinggemma-300m",
                     "embedding_base_url": "",
                     "embedding_api_key": "",
                     "embedding_status": None,
@@ -451,7 +453,7 @@ def sidebar_configuration() -> None:
     with st.sidebar.expander("Embeddings", expanded=False):
         embedding_status_placeholder = st.empty()
         _render_status(st.session_state.get("embedding_status"), embedding_status_placeholder)
-        embedding_options = ["none", "huggingface", "ollama"]
+        embedding_options = ["huggingface", "ollama"]
         previous_embedding_provider = st.session_state["embedding_provider"]
         embedding_provider = st.selectbox(
             "Embedding provider",
@@ -609,7 +611,7 @@ def sidebar_configuration() -> None:
                 )
                 embedding_config = EmbeddingConfig(
                     provider=embedding_provider,
-                    model=embedding_model or None,
+                    model=embedding_model,
                     base_url=embedding_base_url or None,
                     api_key=embedding_api_key or None,
                 )
@@ -689,45 +691,30 @@ def _test_llm_connection(provider: str, model: str, base_url: str | None, api_ke
             if not api_key:
                 return "error", "Hugging Face API key is required."
             try:
-                from huggingface_hub import InferenceClient
+                from openai import OpenAI
             except ImportError:
-                return "error", "huggingface_hub package missing. Install with `pip install huggingface_hub`."
-            routed_base = False
-            if ":" in model and not base_url:
-                routed_base = True
-                base_url = "https://router.huggingface.co/v1"
-            client_kwargs: Dict[str, Any] = {"token": api_key}
-            if base_url:
-                client_kwargs["base_url"] = base_url
-            client = InferenceClient(**client_kwargs)
+                return "error", "openai package missing. Install with `pip install openai`."
+            # Always hit the HF OpenAI-compatible router for chat models
+            base = (base_url or "https://router.huggingface.co/v1").rstrip("/")
+            client = OpenAI(base_url=base, api_key=api_key or "")
             try:
                 response = client.chat.completions.create(
                     model=model,
-                    messages=[{"role": "user", "content": [{"type": "text", "text": "ping"}]}],
+                    messages=[{"role": "user", "content": "ping"}],
                     max_tokens=16,
+                    # Prefer a widely available provider to avoid 401s on private providers
+                    extra_body={"provider": "nscale"},
                 )
-                content = response.choices[0].message.content if response.choices else ""
-                if isinstance(content, list):
-                    snippet = " ".join(
-                        block.get("text", "") for block in content if isinstance(block, dict) and block.get("type") == "text"
-                    )
-                else:
-                    snippet = str(content or "")
+                content = ""
+                if response.choices:
+                    content = response.choices[0].message.content or ""
+                snippet = content.strip()
             except Exception as exc:  # noqa: BLE001
-                error_msg = str(exc)
-                if ":" in model and "HFValidationError" in error_msg:
-                    return (
-                        "error",
-                        f"Hugging Face rejected alias '{model}'. Provide the router base URL or deploy a custom endpoint.",
-                    )
-                output = client.text_generation("ping", model=model, max_new_tokens=10)
-                snippet = output.strip()
+                return "error", f"Hugging Face router error: {exc}"
             snippet = snippet.strip()
             if len(snippet) > 80:
                 snippet = snippet[:80] + "…"
-            message = f"Hugging Face responded: {snippet or '<<empty>>'}"
-            if routed_base:
-                message += " (using router endpoint)"
+            message = f"Hugging Face responded: {snippet or '<<empty>>'} (using router endpoint)"
             return "success", message
         return "warning", f"LLM connectivity test not implemented for provider '{provider}'."
     except Exception as exc:  # noqa: BLE001
@@ -740,7 +727,7 @@ def _test_embedding_connection(
     base_url: str,
     api_key: str,
 ) -> Tuple[str, str]:
-    provider_key = (provider or "none").lower()
+    provider_key = (provider or "").lower()
     try:
         LOGGER.debug(
             "Testing embedding connection",
@@ -751,8 +738,8 @@ def _test_embedding_connection(
                 "has_api_key": bool(api_key),
             },
         )
-        if provider_key in {"", "none"}:
-            return "warning", "Embeddings are disabled (provider set to 'none')."
+        if not provider_key:
+            return "error", "Embedding provider is required."
         if not model.strip():
             return "error", "Embedding model is required."
         if provider_key == "huggingface":
@@ -960,6 +947,21 @@ def main() -> None:
                             st.warning(result["plan"]["sql_generation_note"])
                         st.success("Analysis complete.")
                     st.markdown(result["answer"])
+                    
+                    # Display the full prompt and final SQL
+                    if result.get("formatted_prompt") or result.get("final_sql"):
+                        with st.expander("📋 Full Prompt & Final SQL (After Intent Critic/Repair)", expanded=False):
+                            if result.get("final_sql"):
+                                st.subheader("Final SQL (After All Intent Repairs)")
+                                st.caption("This is the SQL that will be executed, after all intent critic/repair iterations.")
+                                st.code(result["final_sql"], language="sql")
+                                st.divider()
+                            
+                            if result.get("formatted_prompt"):
+                                st.subheader("Full Planner Prompt")
+                                st.caption("This is the complete prompt including all graph context (tables, columns, relationships) that was sent to the planner LLM to generate the SQL query. This prompt is logged at INFO level in the application logs.")
+                                st.code(result["formatted_prompt"], language="text")
+                    
                     if result.get("plan"):
                         with st.expander("LLM Plan", expanded=False):
                             st.json(result["plan"])

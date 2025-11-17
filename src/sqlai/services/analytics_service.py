@@ -28,6 +28,7 @@ from sqlai.config import (
     load_database_config,
     load_embedding_config,
     load_llm_config,
+    load_vector_store_config,
 )
 from sqlai.database.connectors import build_sql_database, create_db_engine, test_connection
 from sqlai.database.schema_introspector import (
@@ -41,6 +42,8 @@ from sqlai.semantic.retriever import RetrievalResult, SemanticRetriever
 from sqlai.llm.providers import LLMProviderError, load_chat_model
 from sqlai.services.metadata_cache import MetadataCache
 from sqlai.services.conversation_cache import ConversationCache
+from sqlai.services.graph_cache import GraphCache, GraphCardRecord
+from sqlai.services.vector_store import VectorStoreManager
 from sqlai.utils.logging import get_logger
 
 LOGGER = get_logger(__name__)
@@ -60,8 +63,19 @@ class AnalyticsService:
         self.db_config = db_config or load_database_config()
         self.llm_config = llm_config or load_llm_config()
         self.embedding_config = embedding_config or load_embedding_config()
-        self.semantic_retriever = SemanticRetriever(self.embedding_config)
+        self.vector_config = load_vector_store_config()
         self.app_config = load_app_config()
+        self.graph_cache = GraphCache(self.app_config.cache_dir / "graph_cards.db")
+        self._validate_runtime_requirements()
+        self.vector_store = VectorStoreManager(
+            self.vector_config,
+            self.app_config.cache_dir,
+            self.embedding_config,
+        )
+        self.semantic_retriever = SemanticRetriever(
+            self.embedding_config,
+            vector_store=self.vector_store,
+        )
         self.metadata_cache = MetadataCache(self.app_config.cache_dir / "table_metadata.db")
         self.conversation_cache = ConversationCache(self.app_config.cache_dir / "conversation_history.db")
         self.table_hashes: Dict[str, str] = {}
@@ -94,6 +108,7 @@ class AnalyticsService:
             summaries=self.schema_summaries,
             schema=self.db_config.schema,
         )
+        self._sync_graph_cache_and_vectors()
         self.row_cap = self.db_config.sample_row_limit
 
         self.workflow = create_query_workflow(self.llm, self.engine)
@@ -101,6 +116,7 @@ class AnalyticsService:
         self.conversation: List[Dict[str, Any]] = []
 
     def schema_markdown(self) -> str:
+        """Build schema markdown from all schema summaries (legacy method)."""
         if not self.schema_summaries:
             return ""
         summaries = [
@@ -112,6 +128,39 @@ class AnalyticsService:
             }
             for summary in self.schema_summaries
         ]
+        return format_schema_markdown(summaries)
+    
+    def _build_schema_markdown_from_tables(self, table_cards: List[TableCard]) -> str:
+        """Build schema markdown from selected table cards only (respects schema preference)."""
+        if not table_cards:
+            return ""
+        # Build summaries from table cards
+        summaries = []
+        for card in table_cards:
+            # TableCard.name is just the table name, card.schema is the schema
+            table_name = f"{card.schema}.{card.name}" if card.schema else card.name
+            # Find matching schema summary to get FK details
+            matching_summary = None
+            for summary in self.schema_summaries:
+                # Match by name and schema
+                summary_schema = getattr(summary, "schema", None)
+                if summary.name == card.name and (
+                    (card.schema and summary_schema == card.schema) or
+                    (not card.schema and not summary_schema)
+                ):
+                    matching_summary = summary
+                    break
+            
+            fk_details = []
+            if matching_summary:
+                fk_details = [_format_fk_detail(fk) for fk in matching_summary.foreign_keys]
+            
+            summaries.append({
+                "table": table_name,
+                "columns": ", ".join(col.name for col in card.columns),
+                "foreign_keys": ", ".join(fk_details) if fk_details else "",
+                "row_estimate": str(card.row_estimate) if card.row_estimate else "",
+            })
         return format_schema_markdown(summaries)
 
     def has_schema(self) -> bool:
@@ -151,11 +200,14 @@ class AnalyticsService:
         metadata_snapshot = self.graph_context.serialize_metadata()
         prompt_inputs["user_question"] = question
 
+        # Build schema_markdown from selected tables only (schema preference already applied)
+        selected_schema_markdown = self._build_schema_markdown_from_tables(retrieval.tables)
+        
         result_state = self.workflow.invoke(
             {
                 "question": question,
                 "prompt_inputs": prompt_inputs,
-                "schema_markdown": self.schema_markdown(),
+                "schema_markdown": selected_schema_markdown,  # Use selected tables only
                 "dialect_hint": self.dialect_hint,
                 "schema_name": self.db_config.schema or "",
                 "dialect": self.dialect,
@@ -170,6 +222,8 @@ class AnalyticsService:
             "chart": result_state["answer"].get("chart"),
             "followups": result_state["answer"].get("followups") or [],
             "plan": result_state.get("plan"),
+            "formatted_prompt": result_state.get("formatted_prompt"),  # Full prompt sent to planner LLM
+            "final_sql": result_state.get("final_sql"),  # Final SQL after all intent repairs (before execution)
             "execution_error": result_state.get("execution_error"),
             "executions": [
                 {
@@ -290,6 +344,139 @@ class AnalyticsService:
         except Exception as exc:  # noqa: BLE001
             LOGGER.debug("Failed to persist saved query: %s", exc)
 
+    def _validate_runtime_requirements(self) -> None:
+        embed_provider = (self.embedding_config.provider or "").strip().lower()
+        if not embed_provider:
+            raise ValueError(
+                "Embedding provider is required. Set SQLAI_EMBED_PROVIDER (e.g. 'huggingface') "
+                "and restart the agent."
+            )
+        if not self.embedding_config.model:
+            raise ValueError(
+                "Embedding model is required. Set SQLAI_EMBED_MODEL "
+                "(e.g. 'google/embeddinggemma-300m')."
+            )
+        if embed_provider == "huggingface" and not self.embedding_config.api_key:
+            raise ValueError(
+                "Hugging Face embeddings require an API key. Set SQLAI_EMBED_API_KEY with a valid token."
+            )
+
+    def _sync_graph_cache_and_vectors(self) -> None:
+        if not self.schema_summaries:
+            return
+        schema_key = self._schema_key() or "(default)"
+        existing_tables = set(self.graph_cache.list_tables(schema_key))
+        current_tables = {summary.name for summary in self.schema_summaries}
+        removed_tables = existing_tables - current_tables
+        if removed_tables:
+            LOGGER.info(
+                "Removing graph cache entries for dropped tables: %s",
+                ", ".join(sorted(removed_tables)),
+            )
+            self.graph_cache.delete_tables(schema_key, removed_tables)
+            self.vector_store.delete_tables(schema_key, removed_tables)
+
+        tables_to_refresh: List[str] = []
+        for summary in self.schema_summaries:
+            table_name = summary.name
+            schema_hash = self.table_hashes.get(table_name)
+            if not schema_hash:
+                continue
+            cached_hash = self.graph_cache.get_table_hash(schema_key, table_name)
+            if cached_hash == schema_hash:
+                continue
+            records = self._build_graph_card_records(schema_key, table_name, schema_hash)
+            self.graph_cache.replace_table_cards(schema_key, table_name, schema_hash, records)
+            tables_to_refresh.append(table_name)
+
+        if tables_to_refresh:
+            LOGGER.info(
+                "Refreshing vector store for %s table(s): %s",
+                len(tables_to_refresh),
+                ", ".join(tables_to_refresh[:10]),
+            )
+            self.vector_store.refresh_tables(
+                schema_key,
+                tables_to_refresh,
+                self.graph_cache,
+                self.semantic_retriever.provider,
+            )
+
+    def _build_graph_card_records(
+        self,
+        schema: str,
+        table_name: str,
+        schema_hash: str,
+    ) -> List[GraphCardRecord]:
+        records: List[GraphCardRecord] = []
+        table_card = next((card for card in self.graph_context.tables if card.name == table_name), None)
+        if table_card:
+            metadata: Dict[str, Any] = {}
+            if table_card.row_estimate is not None:
+                metadata["row_estimate"] = table_card.row_estimate
+            if table_card.comment:
+                metadata["comment"] = table_card.comment
+            records.append(
+                GraphCardRecord(
+                    schema=schema,
+                    table=table_name,
+                    card_type="table",
+                    identifier="__table__",
+                    schema_hash=schema_hash,
+                    text=table_card.render(),
+                    metadata=metadata,
+                )
+            )
+
+        column_cards = [card for card in self.graph_context.column_cards if card.table == table_name]
+        for column_card in column_cards:
+            column = column_card.column
+            metadata = {
+                "column": column.name,
+                "type": str(column.type),
+                "nullable": column.nullable,
+            }
+            if column.comment:
+                metadata["comment"] = column.comment
+            if column_card.sample_values:
+                metadata["sample_values"] = column_card.sample_values[:5]
+            records.append(
+                GraphCardRecord(
+                    schema=schema,
+                    table=table_name,
+                    card_type="column",
+                    identifier=column.name,
+                    schema_hash=schema_hash,
+                    text=column_card.render(),
+                    metadata=metadata,
+                )
+            )
+
+        relationship_cards = [
+            card for card in self.graph_context.relationships if card.table == table_name
+        ]
+        for rel_card in relationship_cards:
+            identifier = (
+                f"{','.join(rel_card.detail.constrained_columns)}->{rel_card.detail.referred_table}"
+            )
+            metadata = {
+                "referred_table": rel_card.detail.referred_table,
+                "constrained_columns": rel_card.detail.constrained_columns,
+                "referred_columns": rel_card.detail.referred_columns,
+            }
+            records.append(
+                GraphCardRecord(
+                    schema=schema,
+                    table=table_name,
+                    card_type="relationship",
+                    identifier=identifier,
+                    schema_hash=schema_hash,
+                    text=rel_card.render(),
+                    metadata=metadata,
+                )
+            )
+        return records
+
     def _hydrate_table_metadata(self) -> None:
         schema_key = self._schema_key()
         summaries = self.schema_summaries
@@ -356,12 +543,22 @@ class AnalyticsService:
                     replace(column, sample_values=samples.get(column.name))
                     for column in summary.columns
                 ]
-                hydrated_summary = replace(summary, columns=columns, description=description)
+                hydrated_summary = replace(
+                    summary,
+                    columns=columns,
+                    description=description,
+                    comment=description or summary.comment,
+                )
                 LOGGER.debug("Finished metadata hydration for table '%s'", table_name)
                 return hydrated_summary
             except Exception as exc:  # noqa: BLE001
-                LOGGER.exception("Failed to hydrate metadata for table '%s': %s", table_name, exc)
-                return summary
+                LOGGER.error(
+                    "Metadata hydration failed for table '%s': %s",
+                    table_name,
+                    exc,
+                    exc_info=True,
+                )
+                raise
 
         if total_tables > 50:
             max_workers = min(5, total_tables)
@@ -438,7 +635,6 @@ class AnalyticsService:
             f"Columns:\n{column_lines}\n"
             f"Foreign keys:\n{fk_text}\n"
         )
-        description = None
         try:
             with self._llm_lock:
                 response = self.llm.invoke(
@@ -454,19 +650,19 @@ class AnalyticsService:
                 )
             description = getattr(response, "content", None)
         except Exception as exc:  # noqa: BLE001
-            LOGGER.debug("LLM description generation failed for %s: %s", summary.name, exc)
-            description = None
-        if description:
-            return description.strip()
-        # Fallback deterministic description
-        column_descriptions = ", ".join(
-            f"{column.name} ({column.type})" for column in summary.columns
-        )
-        fk_description = "; ".join(_format_fk_detail(fk) for fk in summary.foreign_keys) if summary.foreign_keys else "none"
-        return (
-            f"Table {summary.name} contains columns {column_descriptions}. "
-            f"Foreign keys: {fk_description}."
-        )
+            LOGGER.error("LLM description generation failed for %s: %s", summary.name, exc, exc_info=True)
+            raise RuntimeError(
+                f"LLM description generation failed for table '{summary.name}'. "
+                "Fix the LLM configuration before continuing."
+            ) from exc
+        if not description or not str(description).strip():
+            raise RuntimeError(
+                f"LLM returned an empty description for table '{summary.name}'. "
+                "Cannot proceed without valid descriptions."
+            )
+        description_text = str(description).strip()
+        LOGGER.info("Table description for %s: %s", summary.name, description_text)
+        return description_text
 
     def _collect_column_samples(self, summary) -> Dict[str, List[str]]:
         qualified_table = self._qualify_table(summary.name)

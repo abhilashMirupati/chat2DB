@@ -28,9 +28,7 @@ src/sqlai/semantic/__init__.py
 src/sqlai/semantic/retriever.py
 src/sqlai/services/__init__.py
 src/sqlai/services/analytics_service.py
-src/sqlai/services/conversation_cache.py
 src/sqlai/services/domain_fallbacks.py
-src/sqlai/services/metadata_cache.py
 src/sqlai/services/visualization.py
 src/sqlai/ui/__init__.py
 src/sqlai/ui/app.py

@@ -31,6 +31,13 @@ class NullEmbeddingProvider(EmbeddingProvider):
 
 
 class HuggingFaceEmbeddingProvider(EmbeddingProvider):
+    """
+    Hugging Face embedding provider using native InferenceClient.
+    
+    Note: Unlike LLM chat models (which use OpenAI-compatible client for router endpoints),
+    embeddings use the native huggingface_hub.InferenceClient directly.
+    This is because HF embeddings API is not OpenAI-compatible.
+    """
     def __init__(self, model: str, api_key: str, base_url: str | None = None) -> None:
         if not model:
             raise ValueError("Hugging Face embedding provider requires a model name.")
@@ -39,6 +46,7 @@ class HuggingFaceEmbeddingProvider(EmbeddingProvider):
         if base_url:
             kwargs["base_url"] = base_url
         try:
+            # Use native HF InferenceClient (not OpenAI client) for embeddings
             self.client = InferenceClient(model=model, **kwargs)
         except Exception as exc:  # noqa: BLE001
             raise RuntimeError(f"Failed to initialise Hugging Face client: {exc}") from exc
@@ -93,8 +101,8 @@ def _coerce_embedding(response: object) -> np.ndarray:
 
 
 def create_embedding_provider(config: Optional[EmbeddingConfig]) -> Optional[EmbeddingProvider]:
-    if not config or config.provider == "none":
-        return None
+    if not config:
+        raise ValueError("Embedding configuration is required.")
     provider = config.provider.lower()
     if provider == "huggingface":
         if not config.model or not config.api_key:
