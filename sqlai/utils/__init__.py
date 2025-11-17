@@ -1,4 +1,0 @@
-"""
-Shared utilities for SQLAI.
-"""
-

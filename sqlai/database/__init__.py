@@ -1,4 +1,0 @@
-"""
-Database interaction utilities.
-"""
-
