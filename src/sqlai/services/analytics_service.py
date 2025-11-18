@@ -592,12 +592,21 @@ class AnalyticsService:
                 cached = cached_metadata.get(table_name)
                 cached_hash = cached.get("schema_hash") if cached else None
                 cache_hit = bool(cached and cached_hash == schema_hash)
+                if not cache_hit and cached_hash:
+                    LOGGER.warning(
+                        "Schema hash mismatch for '%s': cached=%s current=%s. "
+                        "This may indicate schema changes or non-deterministic hash calculation. "
+                        "Regenerating metadata.",
+                        table_name,
+                        cached_hash[:16] if cached_hash else None,
+                        schema_hash[:16] if schema_hash else None,
+                    )
                 LOGGER.debug(
                     "Cache lookup for '%s': hit=%s cached_hash=%s current_hash=%s",
                     table_name,
                     cache_hit,
-                    cached_hash,
-                    schema_hash,
+                    cached_hash[:16] if cached_hash else None,
+                    schema_hash[:16] if schema_hash else None,
                 )
                 if cache_hit and cached:
                     samples: Dict[str, List[str]] = cached.get("samples") or {}
@@ -721,15 +730,31 @@ class AnalyticsService:
         return ""
 
     def _table_schema_hash(self, summary) -> str:
+        # Sort columns by name for deterministic hashing
+        sorted_columns = sorted(summary.columns, key=lambda c: c.name)
         payload_parts = [
             f"{column.name}:{column.type}:{column.nullable}"
-            for column in summary.columns
+            for column in sorted_columns
         ]
         if summary.foreign_keys:
-            # Use consistent FK formatting for hash stability
-            payload_parts.extend(
-                [f"fk:{_format_fk_detail(fk)}" for fk in summary.foreign_keys]
+            # Sort foreign keys by their string representation for deterministic hashing
+            # Also ensure FK column lists are sorted in the hash
+            sorted_fks = sorted(
+                summary.foreign_keys,
+                key=lambda fk: (
+                    ",".join(sorted(fk.constrained_columns)),
+                    fk.referred_schema or "",
+                    fk.referred_table,
+                    ",".join(sorted(fk.referred_columns)),
+                ),
             )
+            # Format FK with sorted columns for deterministic hash
+            for fk in sorted_fks:
+                left = ",".join(sorted(fk.constrained_columns))
+                right_schema = f"{fk.referred_schema}." if fk.referred_schema else ""
+                right = ",".join(sorted(fk.referred_columns))
+                fk_str = f"fk:[{left}] -> {right_schema}{fk.referred_table}.[{right}]"
+                payload_parts.append(fk_str)
         payload = "|".join(payload_parts).encode("utf-8")
         return hashlib.sha256(payload).hexdigest()
 
