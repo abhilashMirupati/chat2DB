@@ -121,3 +121,28 @@ class MetadataCache:
                 "updated_at": row[5],
             }
 
+    def fetch_schema(self, schema: str) -> Dict[str, Dict[str, object]]:
+        """
+        Return all cached metadata entries for a schema in a single query.
+        """
+        with self._lock:
+            cursor = self.conn.execute(
+                """
+                SELECT table_name, schema_hash, description, samples_json
+                FROM table_metadata
+                WHERE schema_name = ?
+                """,
+                (schema,),
+            )
+            rows = cursor.fetchall()
+
+        cached: Dict[str, Dict[str, object]] = {}
+        for row in rows:
+            table_name, schema_hash, description, samples_json = row
+            cached[table_name] = {
+                "schema_hash": schema_hash,
+                "description": description,
+                "samples": json.loads(samples_json) if samples_json else {},
+            }
+        return cached
+

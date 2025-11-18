@@ -479,6 +479,7 @@ class AnalyticsService:
 
     def _hydrate_table_metadata(self) -> None:
         schema_key = self._schema_key()
+        schema_cache_key = schema_key or ""
         summaries = self.schema_summaries
         total_tables = len(summaries)
         if total_tables == 0:
@@ -492,13 +493,14 @@ class AnalyticsService:
         )
 
         self.table_hashes = {summary.name: self._table_schema_hash(summary) for summary in summaries}
+        cached_metadata = self.metadata_cache.fetch_schema(schema_cache_key)
 
         def process_summary(summary: TableSummary) -> TableSummary:
             table_name = summary.name
             schema_hash = self.table_hashes[table_name]
             LOGGER.debug("Starting metadata hydration for table '%s'", table_name)
             try:
-                cached = self.metadata_cache.fetch(schema_key, table_name)
+                cached = cached_metadata.get(table_name)
                 cached_hash = cached.get("schema_hash") if cached else None
                 cache_hit = bool(cached and cached_hash == schema_hash)
                 LOGGER.debug(
@@ -536,7 +538,7 @@ class AnalyticsService:
                 else:
                     LOGGER.debug("Reusing cached samples for table '%s'", table_name)
 
-                self.metadata_cache.upsert(schema_key, table_name, schema_hash, description, samples)
+                self.metadata_cache.upsert(schema_cache_key, table_name, schema_hash, description, samples)
                 LOGGER.debug("Persisted metadata for table '%s' into cache.", table_name)
 
                 columns = [
@@ -667,22 +669,22 @@ class AnalyticsService:
     def _collect_column_samples(self, summary) -> Dict[str, List[str]]:
         qualified_table = self._qualify_table(summary.name)
         samples: Dict[str, List[str]] = {}
+        limit = min(50, self.db_config.sample_row_limit or 50)
+        query = self._sample_query(qualified_table, limit=limit)
+        try:
+            df = pd.read_sql_query(query, self.engine)
+        except Exception as exc:  # noqa: BLE001
+            LOGGER.debug("Sample fetch failed for %s: %s", qualified_table, exc)
+            return samples
+
+        if df.empty:
+            return samples
+
         for column in summary.columns:
-            try:
-                query = self._sample_values_query(qualified_table, column.name)
-                df = pd.read_sql_query(query, self.engine)
-            except Exception as exc:  # noqa: BLE001
-                LOGGER.debug(
-                    "Distinct sample fetch failed for %s.%s: %s",
-                    qualified_table,
-                    column.name,
-                    exc,
-                )
-                continue
-            if df.empty:
+            if column.name not in df.columns:
                 continue
             values = (
-                df["value"]
+                df[column.name]
                 .dropna()
                 .astype(str)
                 .unique()
@@ -737,35 +739,6 @@ class AnalyticsService:
         if dialect in {"mssql", "sqlserver"}:
             return f"SELECT TOP ({limit}) * FROM {qualified_table}"
         return f"SELECT * FROM {qualified_table}"
-
-    def _sample_values_query(self, qualified_table: str, column_name: str, limit: int = 25) -> str:
-        dialect = self.dialect
-        if dialect.startswith("oracle"):
-            return (
-                f"SELECT DISTINCT {column_name} AS value "
-                f"FROM {qualified_table} "
-                f"WHERE {column_name} IS NOT NULL "
-                f"FETCH FIRST {limit} ROWS ONLY"
-            )
-        if dialect in {"postgresql", "postgres", "mysql", "mariadb", "sqlite"}:
-            return (
-                f"SELECT DISTINCT {column_name} AS value "
-                f"FROM {qualified_table} "
-                f"WHERE {column_name} IS NOT NULL "
-                f"LIMIT {limit}"
-            )
-        if dialect in {"mssql", "sqlserver"}:
-            return (
-                f"SELECT DISTINCT TOP ({limit}) {column_name} AS value "
-                f"FROM {qualified_table} "
-                f"WHERE {column_name} IS NOT NULL"
-            )
-        return (
-            f"SELECT DISTINCT {column_name} AS value "
-            f"FROM {qualified_table} "
-            f"WHERE {column_name} IS NOT NULL "
-            f"LIMIT {limit}"
-        )
 
     def _qualify_table(self, table: str) -> str:
         if self.db_config.schema and "." not in table:
