@@ -4,6 +4,7 @@ Schema introspection helpers for summarising databases.
 
 from __future__ import annotations
 
+import logging
 from concurrent.futures import ThreadPoolExecutor, as_completed
 from dataclasses import dataclass
 from typing import Iterable, List, Optional
@@ -11,6 +12,8 @@ from typing import Iterable, List, Optional
 import pandas as pd
 from sqlalchemy import inspect
 from sqlalchemy.engine import Engine
+
+LOGGER = logging.getLogger(__name__)
 
 
 @dataclass(frozen=True)
@@ -97,10 +100,21 @@ def introspect_database(
         )
 
     if len(filtered_tables) <= 30:
-        return [_collect(table) for table in filtered_tables]
+        summaries = []
+        for table in filtered_tables:
+            try:
+                summaries.append(_collect(table))
+            except Exception as exc:  # noqa: BLE001
+                LOGGER.warning(
+                    "Failed to introspect table '%s': %s. Skipping and continuing.",
+                    table,
+                    exc,
+                )
+        return summaries
 
     max_workers = min(8, len(filtered_tables))
     summary_map: dict[str, TableSummary] = {}
+    failed_tables = []
     with ThreadPoolExecutor(max_workers=max_workers) as executor:
         future_map = {
             executor.submit(_collect, table): table for table in filtered_tables
@@ -110,7 +124,20 @@ def introspect_database(
             try:
                 summary_map[table] = future.result()
             except Exception as exc:  # noqa: BLE001
-                raise RuntimeError(f"Failed to introspect table '{table}': {exc}") from exc
+                LOGGER.warning(
+                    "Failed to introspect table '%s': %s. Skipping and continuing.",
+                    table,
+                    exc,
+                )
+                failed_tables.append(table)
+
+    if failed_tables:
+        LOGGER.warning(
+            "Failed to introspect %s table(s): %s. Continuing with %s successful table(s).",
+            len(failed_tables),
+            ", ".join(failed_tables[:10]),
+            len(summary_map),
+        )
 
     return [summary_map[table] for table in filtered_tables if table in summary_map]
 
