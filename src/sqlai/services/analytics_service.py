@@ -420,6 +420,7 @@ class AnalyticsService:
         # Identify tables that need refresh (hash mismatch or missing)
         tables_to_refresh: List[str] = []
         summaries_to_process: List[TableSummary] = []
+        cached_tables_count = 0
         for summary in self.schema_summaries:
             table_name = summary.name
             schema_hash = self.table_hashes.get(table_name)
@@ -428,20 +429,33 @@ class AnalyticsService:
             cached_hash = cached_hashes.get(table_name)
             # Empty hash indicates migration/invalidation - treat as cache miss
             if cached_hash and cached_hash == schema_hash:
+                cached_tables_count += 1
                 continue  # Cache hit, skip
             summaries_to_process.append(summary)
             tables_to_refresh.append(table_name)
 
+        failed_graph_tables: List[str] = []
+        timeout_graph_tables: List[str] = []
+        
         if not summaries_to_process:
             LOGGER.info(
                 "All %s table(s) already have cached graph cards with matching schema hashes. Skipping graph card building.",
                 len(self.schema_summaries),
             )
+            LOGGER.info("")
+            LOGGER.info("=" * 80)
+            LOGGER.info("GRAPH CARD BUILDING SUMMARY")
+            LOGGER.info("=" * 80)
+            LOGGER.info("Total tables: %s", len(self.schema_summaries))
+            LOGGER.info("✓ All tables have cached graph cards (no rebuild needed)")
+            LOGGER.info("=" * 80)
+            LOGGER.info("")
             return
 
         LOGGER.info(
-            "Building graph cards for %s table(s) that need refresh.",
+            "Building graph cards for %s table(s) that need refresh (%s already cached).",
             len(summaries_to_process),
+            cached_tables_count,
         )
 
         # Parallelize graph card building
@@ -459,9 +473,25 @@ class AnalyticsService:
                 if not schema_hash:
                     LOGGER.warning("No schema hash found for table '%s', skipping graph card building.", table_name)
                     return
+                # Find table index for progress tracking
+                table_idx = next((i for i, s in enumerate(self.schema_summaries) if s.name == table_name), -1)
+                table_num = table_idx + 1 if table_idx >= 0 else "?"
+                total = len(self.schema_summaries)
+                LOGGER.info(
+                    "[Graph Cards] Building for table %s/%s: '%s'",
+                    table_num,
+                    total,
+                    table_name,
+                )
                 try:
                     records = self._build_graph_card_records(schema_key, table_name, schema_hash)
                     self.graph_cache.replace_table_cards(schema_key, table_name, schema_hash, records)
+                    LOGGER.info(
+                        "[Graph Cards] ✓ Completed table %s/%s: '%s'",
+                        table_num,
+                        total,
+                        table_name,
+                    )
                 except Exception as exc:  # noqa: BLE001
                     LOGGER.exception(
                         "Failed to build graph cards for table '%s': %s",
@@ -475,40 +505,126 @@ class AnalyticsService:
                     executor.submit(process_table, summary): summary.name
                     for summary in summaries_to_process
                 }
+                completed = 0
                 for future in as_completed(futures):
                     table_name = futures[future]
+                    completed += 1
+                    # Find table index
+                    table_idx = next((i for i, s in enumerate(self.schema_summaries) if s.name == table_name), -1)
+                    table_num = table_idx + 1 if table_idx >= 0 else "?"
+                    total = len(self.schema_summaries)
                     try:
                         # Add timeout to prevent hanging
                         future.result(timeout=60.0)
+                        LOGGER.info(
+                            "[Graph Cards] Progress: %s/%s tables completed (%.1f%%)",
+                            completed,
+                            len(summaries_to_process),
+                            (completed / len(summaries_to_process) * 100) if summaries_to_process else 0,
+                        )
                     except TimeoutError:
                         LOGGER.error(
-                            "Graph card building timed out (60s) for table '%s'. Skipping.",
+                            "[Graph Cards] ✗ TIMEOUT table %s/%s: '%s' (60s exceeded). Skipping.",
+                            table_num,
+                            total,
                             table_name,
                         )
+                        timeout_graph_tables.append(table_name)
                     except Exception as exc:  # noqa: BLE001
                         LOGGER.error(
-                            "Graph card building failed for table '%s': %s",
+                            "[Graph Cards] ✗ FAILED table %s/%s: '%s' - %s",
+                            table_num,
+                            total,
                             table_name,
                             exc,
                         )
+                        failed_graph_tables.append(f"{table_name} ({str(exc)[:100]})")
         else:
             # Sequential for small batches
-            for summary in summaries_to_process:
+            for idx, summary in enumerate(summaries_to_process):
                 table_name = summary.name
                 schema_hash = self.table_hashes.get(table_name)
                 if not schema_hash:
                     LOGGER.warning("No schema hash found for table '%s', skipping graph card building.", table_name)
                     continue
+                table_num = idx + 1
+                total = len(summaries_to_process)
+                LOGGER.info(
+                    "[Graph Cards] Building for table %s/%s: '%s' (sequential mode)",
+                    table_num,
+                    total,
+                    table_name,
+                )
                 try:
                     records = self._build_graph_card_records(schema_key, table_name, schema_hash)
                     self.graph_cache.replace_table_cards(schema_key, table_name, schema_hash, records)
+                    LOGGER.info(
+                        "[Graph Cards] ✓ Completed table %s/%s: '%s'",
+                        table_num,
+                        total,
+                        table_name,
+                    )
                 except Exception as exc:  # noqa: BLE001
                     LOGGER.exception(
-                        "Failed to build graph cards for table '%s': %s",
+                        "[Graph Cards] ✗ FAILED table %s/%s: '%s' - %s",
+                        table_num,
+                        total,
                         table_name,
                         exc,
                     )
-                    raise
+                    failed_graph_tables.append(f"{table_name} ({str(exc)[:100]})")
+                    # Continue with other tables instead of raising
+
+        # Verify all tables have graph cards
+        all_tables_with_cards = set(self.graph_cache.list_tables(schema_key))
+        missing_cards: List[str] = []
+        for summary in self.schema_summaries:
+            if summary.name not in all_tables_with_cards:
+                missing_cards.append(summary.name)
+        
+        # Print summary
+        LOGGER.info("")
+        LOGGER.info("=" * 80)
+        LOGGER.info("GRAPH CARD BUILDING SUMMARY")
+        LOGGER.info("=" * 80)
+        LOGGER.info("Total tables: %s", len(self.schema_summaries))
+        LOGGER.info("  - Already cached: %s", cached_tables_count)
+        successful_built = len(summaries_to_process) - len(failed_graph_tables) - len(timeout_graph_tables)
+        LOGGER.info("  - Built/refreshed: %s", successful_built)
+        successful_graph = cached_tables_count + successful_built
+        LOGGER.info("✓ Successfully processed: %s", successful_graph)
+        
+        if timeout_graph_tables:
+            LOGGER.warning("")
+            LOGGER.warning("⚠ TIMEOUT (%s table(s)):", len(timeout_graph_tables))
+            for table in timeout_graph_tables:
+                LOGGER.warning("  - %s (exceeded 60s timeout)", table)
+        
+        if failed_graph_tables:
+            LOGGER.error("")
+            LOGGER.error("✗ FAILED (%s table(s)):", len(failed_graph_tables))
+            for table in failed_graph_tables:
+                LOGGER.error("  - %s", table)
+        
+        if missing_cards:
+            LOGGER.error("")
+            LOGGER.error("✗ MISSING GRAPH CARDS (%s table(s)):", len(missing_cards))
+            for table in missing_cards[:20]:  # Show first 20
+                LOGGER.error("  - %s", table)
+            if len(missing_cards) > 20:
+                LOGGER.error("  ... and %s more", len(missing_cards) - 20)
+        
+        if timeout_graph_tables or failed_graph_tables or missing_cards:
+            LOGGER.warning("")
+            LOGGER.warning("⚠ ACTION REQUIRED:")
+            LOGGER.warning("  Some graph cards failed to build or are missing. Please rerun prewarm_metadata.py")
+            LOGGER.warning("  to retry failed tables and ensure all graph cards are cached.")
+        else:
+            LOGGER.info("")
+            LOGGER.info("✓ SUCCESS: All %s tables have graph cards!", len(self.schema_summaries))
+        
+        LOGGER.info("=" * 80)
+        LOGGER.info("")
 
         if tables_to_refresh:
             LOGGER.info(
@@ -627,6 +743,17 @@ class AnalyticsService:
             if not schema_hash:
                 LOGGER.warning("No schema hash found for table '%s', skipping metadata hydration.", table_name)
                 return summary
+            
+            # Find table index for progress tracking
+            table_idx = next((i for i, s in enumerate(summaries) if s.name == table_name), -1)
+            table_num = table_idx + 1 if table_idx >= 0 else "?"
+            LOGGER.info(
+                "[Table %s/%s] Processing: '%s' (hash: %s...)",
+                table_num,
+                total_tables,
+                table_name,
+                schema_hash[:12] if schema_hash else "N/A",
+            )
             LOGGER.debug("Starting metadata hydration for table '%s'", table_name)
             try:
                 cached = cached_metadata.get(table_name)
@@ -692,8 +819,13 @@ class AnalyticsService:
                     description = None
 
                 if not description:
-                    LOGGER.debug("Generating description for table '%s'", table_name)
-                    description = self._generate_table_description(summary)
+                    LOGGER.info(
+                        "[Table %s/%s] Generating description for '%s'...",
+                        table_num,
+                        total_tables,
+                        table_name,
+                    )
+                    description = self._generate_table_description(summary, table_num, total_tables)
                 else:
                     LOGGER.debug("Reusing cached description for table '%s'", table_name)
 
@@ -741,6 +873,8 @@ class AnalyticsService:
 
         cache_hits = 0
         cache_misses = 0
+        failed_tables: List[str] = []
+        timeout_tables: List[str] = []
         
         if total_tables > 50:
             max_workers = min(5, total_tables)
@@ -754,9 +888,18 @@ class AnalyticsService:
                     executor.submit(process_summary, summary): (idx, summary.name)
                     for idx, summary in enumerate(summaries)
                 }
+                completed = 0
                 for future in as_completed(future_map):
                     idx, table_name = future_map[future]
+                    completed += 1
+                    table_num = idx + 1
                     try:
+                        LOGGER.info(
+                            "Waiting for table %s/%s: '%s'...",
+                            table_num,
+                            total_tables,
+                            table_name,
+                        )
                         # Add timeout to prevent hanging if LLM call is stuck
                         # 120 seconds per table (60s lock wait + 60s LLM call)
                         updated_map[table_name] = future.result(timeout=120.0)
@@ -764,47 +907,137 @@ class AnalyticsService:
                         cached = cached_metadata.get(table_name)
                         if cached and cached.get("schema_hash") == self.table_hashes.get(table_name):
                             cache_hits += 1
+                            LOGGER.info(
+                                "✓ Completed table %s/%s: '%s' (cache hit)",
+                                table_num,
+                                total_tables,
+                                table_name,
+                            )
                         else:
                             cache_misses += 1
+                            LOGGER.info(
+                                "✓ Completed table %s/%s: '%s' (regenerated)",
+                                table_num,
+                                total_tables,
+                                table_name,
+                            )
                     except TimeoutError:
                         LOGGER.error(
-                            "Metadata hydration timed out (120s) for table '%s'. "
+                            "✗ TIMEOUT table %s/%s: '%s' (120s exceeded). "
                             "LLM call may be stuck. Skipping this table.",
+                            table_num,
+                            total_tables,
                             table_name,
                         )
                         # Continue with other tables - use original summary
                         updated_map[table_name] = summaries[idx]
                         cache_misses += 1
+                        timeout_tables.append(table_name)
                     except Exception as exc:  # noqa: BLE001
                         LOGGER.exception(
-                            "Unhandled exception hydrating table '%s': %s",
+                            "✗ FAILED table %s/%s: '%s' - %s",
+                            table_num,
+                            total_tables,
                             table_name,
                             exc,
                         )
                         updated_map[table_name] = summaries[idx]
                         cache_misses += 1
+                        failed_tables.append(f"{table_name} ({str(exc)[:100]})")
+                    
+                    # Progress update
+                    LOGGER.info(
+                        "Progress: %s/%s tables completed (%.1f%%)",
+                        completed,
+                        total_tables,
+                        (completed / total_tables * 100) if total_tables > 0 else 0,
+                    )
             updated_summaries = [
                 updated_map.get(summary.name, summary) for summary in summaries
             ]
         else:
             updated_summaries = []
-            for summary in summaries:
-                result = process_summary(summary)
-                updated_summaries.append(result)
-                # Count cache hits/misses
-                cached = cached_metadata.get(summary.name)
-                if cached and cached.get("schema_hash") == self.table_hashes.get(summary.name):
-                    cache_hits += 1
-                else:
+            for idx, summary in enumerate(summaries):
+                table_num = idx + 1
+                LOGGER.info(
+                    "Processing table %s/%s: '%s' (sequential mode)",
+                    table_num,
+                    total_tables,
+                    summary.name,
+                )
+                try:
+                    result = process_summary(summary)
+                    updated_summaries.append(result)
+                    LOGGER.info(
+                        "✓ Completed table %s/%s: '%s'",
+                        table_num,
+                        total_tables,
+                        summary.name,
+                    )
+                    # Count cache hits/misses
+                    cached = cached_metadata.get(summary.name)
+                    if cached and cached.get("schema_hash") == self.table_hashes.get(summary.name):
+                        cache_hits += 1
+                    else:
+                        cache_misses += 1
+                except TimeoutError:
+                    LOGGER.error(
+                        "✗ TIMEOUT table %s/%s: '%s' (120s exceeded). Skipping.",
+                        table_num,
+                        total_tables,
+                        summary.name,
+                    )
+                    updated_summaries.append(summary)
                     cache_misses += 1
+                    timeout_tables.append(summary.name)
+                except Exception as exc:  # noqa: BLE001
+                    LOGGER.exception(
+                        "✗ FAILED table %s/%s: '%s' - %s",
+                        table_num,
+                        total_tables,
+                        summary.name,
+                        exc,
+                    )
+                    updated_summaries.append(summary)
+                    cache_misses += 1
+                    failed_tables.append(f"{summary.name} ({str(exc)[:100]})")
 
         self.schema_summaries = updated_summaries
-        LOGGER.info(
-            "Metadata hydration complete for %s table(s). Cache hits: %s, Cache misses: %s",
-            total_tables,
-            cache_hits,
-            cache_misses,
-        )
+        
+        # Print summary
+        LOGGER.info("")
+        LOGGER.info("=" * 80)
+        LOGGER.info("METADATA HYDRATION SUMMARY")
+        LOGGER.info("=" * 80)
+        LOGGER.info("Total tables processed: %s", total_tables)
+        successful = len(updated_summaries) - len(failed_tables) - len(timeout_tables)
+        LOGGER.info("✓ Successfully hydrated: %s", successful)
+        LOGGER.info("  - Cache hits (reused): %s", cache_hits)
+        LOGGER.info("  - Cache misses (regenerated): %s", cache_misses - len(failed_tables) - len(timeout_tables))
+        
+        if timeout_tables:
+            LOGGER.warning("")
+            LOGGER.warning("⚠ TIMEOUT (%s table(s)):", len(timeout_tables))
+            for table in timeout_tables:
+                LOGGER.warning("  - %s (exceeded 120s timeout)", table)
+        
+        if failed_tables:
+            LOGGER.error("")
+            LOGGER.error("✗ FAILED (%s table(s)):", len(failed_tables))
+            for table in failed_tables:
+                LOGGER.error("  - %s", table)
+        
+        if timeout_tables or failed_tables:
+            LOGGER.warning("")
+            LOGGER.warning("⚠ ACTION REQUIRED:")
+            LOGGER.warning("  Some tables failed to hydrate. Please rerun prewarm_metadata.py")
+            LOGGER.warning("  to retry failed tables and ensure all metadata is cached.")
+        else:
+            LOGGER.info("")
+            LOGGER.info("✓ SUCCESS: All %s tables hydrated successfully!", total_tables)
+        
+        LOGGER.info("=" * 80)
+        LOGGER.info("")
 
     def _schema_key(self) -> str:
         if self.db_config.schema:
@@ -961,7 +1194,7 @@ class AnalyticsService:
         payload = "|".join(payload_parts).encode("utf-8") if payload_parts else b""
         return hashlib.sha256(payload).hexdigest()
 
-    def _generate_table_description(self, summary) -> str:
+    def _generate_table_description(self, summary, table_num: int | str = "?", total_tables: int = 0) -> str:
         column_lines = "\n".join(
             f"- {column.name}: type={column.type}, nullable={column.nullable}, default={column.default}"
             for column in summary.columns
@@ -1000,7 +1233,12 @@ class AnalyticsService:
                 
                 # Make LLM call - if it hangs, at least other threads can timeout on lock acquisition
                 # Note: We can't interrupt a blocking LLM call, but the lock timeout prevents deadlock
-                LOGGER.debug("Acquired LLM lock for table '%s', making LLM call...", summary.name)
+                LOGGER.info(
+                    "[Table %s/%s] Acquired LLM lock for '%s', calling LLM (may take 10-30 seconds)...",
+                    table_num,
+                    total_tables,
+                    summary.name,
+                )
                 response = self.llm.invoke(
                     [
                         SystemMessage(
@@ -1012,7 +1250,12 @@ class AnalyticsService:
                         HumanMessage(content=prompt),
                     ]
                 )
-                LOGGER.debug("LLM call completed for table '%s'", summary.name)
+                LOGGER.info(
+                    "[Table %s/%s] LLM call completed for '%s'",
+                    table_num,
+                    total_tables,
+                    summary.name,
+                )
                 description = getattr(response, "content", None)
             finally:
                 # CRITICAL: Always release lock, even if LLM call fails or hangs
