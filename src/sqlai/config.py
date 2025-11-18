@@ -171,6 +171,11 @@ class AppConfig(BaseSettings):
         default=None,
         description="Path to a logo image displayed in the UI sidebar.",
     )
+    skip_prewarm_if_cached: bool = Field(
+        default=True,
+        description="If True, skip expensive prewarm steps (LLM calls, sampling) when cache exists. "
+        "Set to False to force refresh or if cache is stale.",
+    )
 
     model_config = SettingsConfigDict(
         env_prefix="SQLAI_",
