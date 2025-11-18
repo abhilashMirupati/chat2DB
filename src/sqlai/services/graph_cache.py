@@ -72,8 +72,26 @@ class GraphCache:
             """
         )
         self._migrate_cache_if_needed()
+        self._cleanup_empty_hashes()
         self.conn.commit()
         atexit.register(self.conn.close)
+
+    def _cleanup_empty_hashes(self) -> None:
+        """
+        Remove any cache entries with empty schema_hash (from old migrations or invalid data).
+        """
+        with self._lock:
+            cursor = self.conn.execute(
+                "SELECT COUNT(*) FROM graph_cards WHERE schema_hash = '' OR schema_hash IS NULL"
+            )
+            count = cursor.fetchone()[0]
+            if count > 0:
+                self.conn.execute("DELETE FROM graph_cards WHERE schema_hash = '' OR schema_hash IS NULL")
+                self.conn.commit()
+                LOGGER.info(
+                    "Cleaned up %s graph cache entries with empty or null schema_hash.",
+                    count,
+                )
 
     def _migrate_cache_if_needed(self) -> None:
         """
@@ -98,15 +116,16 @@ class GraphCache:
             
             if stored_version != CURRENT_VERSION:
                 # Migration needed - old hashes were calculated without sorting
-                # Clear all schema_hash values to force regeneration with new sorted algorithm
+                # Delete all entries to force regeneration with new sorted algorithm
+                # (Better than setting empty hash - avoids confusion)
                 if stored_version is None:
                     # First time - old cache exists, need to invalidate
                     count = self.conn.execute("SELECT COUNT(*) FROM graph_cards").fetchone()[0]
                     if count > 0:
-                        self.conn.execute("UPDATE graph_cards SET schema_hash = ''")
+                        self.conn.execute("DELETE FROM graph_cards")
                         self.conn.commit()
                         LOGGER.info(
-                            "Graph cache migration: Invalidated %s old hash entries. "
+                            "Graph cache migration: Deleted %s old hash entries. "
                             "Graph cards will be regenerated with deterministic sorted hashes.",
                             count,
                         )
@@ -114,10 +133,10 @@ class GraphCache:
                     # Version mismatch - invalidate
                     count = self.conn.execute("SELECT COUNT(*) FROM graph_cards").fetchone()[0]
                     if count > 0:
-                        self.conn.execute("UPDATE graph_cards SET schema_hash = ''")
+                        self.conn.execute("DELETE FROM graph_cards")
                         self.conn.commit()
                         LOGGER.info(
-                            "Graph cache migration: Invalidated %s hash entries due to version change. "
+                            "Graph cache migration: Deleted %s hash entries due to version change. "
                             "Graph cards will be regenerated.",
                             count,
                         )

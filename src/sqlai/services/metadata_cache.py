@@ -45,8 +45,27 @@ class MetadataCache:
             """
         )
         self._migrate_cache_if_needed()
+        self._cleanup_empty_hashes()
         self.conn.commit()
         atexit.register(self.conn.close)
+
+    def _cleanup_empty_hashes(self) -> None:
+        """
+        Mark entries with empty schema_hash for hash recalculation.
+        We keep the entries (descriptions/samples) but will recalculate hashes later.
+        """
+        with self._lock:
+            cursor = self.conn.execute(
+                "SELECT COUNT(*) FROM table_metadata WHERE schema_hash = '' OR schema_hash IS NULL"
+            )
+            count = cursor.fetchone()[0]
+            if count > 0:
+                # Don't delete - just log. Hashes will be recalculated during hydration.
+                LOGGER.info(
+                    "Found %s cache entries with empty or null schema_hash. "
+                    "Hashes will be recalculated during hydration, but descriptions/samples will be preserved if schema unchanged.",
+                    count,
+                )
 
     def _migrate_cache_if_needed(self) -> None:
         """
@@ -71,15 +90,16 @@ class MetadataCache:
             
             if stored_version != CURRENT_VERSION:
                 # Migration needed - old hashes were calculated without sorting
-                # Clear all schema_hash values to force regeneration with new sorted algorithm
+                # Delete all entries to force regeneration with new sorted algorithm
+                # (Better than setting empty hash - avoids confusion)
                 if stored_version is None:
                     # First time - old cache exists, need to invalidate
                     count = self.conn.execute("SELECT COUNT(*) FROM table_metadata").fetchone()[0]
                     if count > 0:
-                        self.conn.execute("UPDATE table_metadata SET schema_hash = ''")
+                        self.conn.execute("DELETE FROM table_metadata")
                         self.conn.commit()
                         LOGGER.info(
-                            "Cache migration: Invalidated %s old hash entries. "
+                            "Cache migration: Deleted %s old hash entries. "
                             "Metadata will be regenerated with deterministic sorted hashes.",
                             count,
                         )
@@ -87,10 +107,10 @@ class MetadataCache:
                     # Version mismatch - invalidate
                     count = self.conn.execute("SELECT COUNT(*) FROM table_metadata").fetchone()[0]
                     if count > 0:
-                        self.conn.execute("UPDATE table_metadata SET schema_hash = ''")
+                        self.conn.execute("DELETE FROM table_metadata")
                         self.conn.commit()
                         LOGGER.info(
-                            "Cache migration: Invalidated %s hash entries due to version change. "
+                            "Cache migration: Deleted %s hash entries due to version change. "
                             "Metadata will be regenerated.",
                             count,
                         )

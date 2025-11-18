@@ -59,6 +59,7 @@ class AnalyticsService:
         db_config: DatabaseConfig | None = None,
         llm_config: LLMConfig | None = None,
         embedding_config: EmbeddingConfig | None = None,
+        skip_prewarm_if_cached: bool | None = None,
     ) -> None:
         self.db_config = db_config or load_database_config()
         self.llm_config = llm_config or load_llm_config()
@@ -95,20 +96,52 @@ class AnalyticsService:
 
         self._llm_lock = threading.Lock()
 
-        self.schema_summaries = introspect_database(
-            self.engine,
-            schema=self.db_config.schema,
-            include_system_tables=self.db_config.include_system_tables,
+        # Check if we should skip prewarm steps when cache exists
+        skip_prewarm = (
+            skip_prewarm_if_cached
+            if skip_prewarm_if_cached is not None
+            else self.app_config.skip_prewarm_if_cached
         )
-        LOGGER.info("Loaded %s tables for schema introspection.", len(self.schema_summaries))
+        
+        # Check if prewarm cache exists and is substantial
+        prewarm_complete = self._is_prewarm_complete() if skip_prewarm else False
 
-        self._hydrate_table_metadata()
+        if prewarm_complete:
+            LOGGER.info(
+                "Prewarm cache detected. Skipping expensive introspection/hydration steps. "
+                "Using cached metadata and graph cards."
+            )
+            # Still need to introspect for schema structure, but we'll skip expensive operations
+            self.schema_summaries = introspect_database(
+                self.engine,
+                schema=self.db_config.schema,
+                include_system_tables=self.db_config.include_system_tables,
+            )
+            LOGGER.info("Loaded %s tables for schema introspection.", len(self.schema_summaries))
+            
+            # Quick hydration - just load from cache, skip LLM calls and sampling
+            self._hydrate_table_metadata_quick()
+        else:
+            # Full prewarm flow
+            self.schema_summaries = introspect_database(
+                self.engine,
+                schema=self.db_config.schema,
+                include_system_tables=self.db_config.include_system_tables,
+            )
+            LOGGER.info("Loaded %s tables for schema introspection.", len(self.schema_summaries))
+
+            self._hydrate_table_metadata()
 
         self.graph_context = build_graph_context(
             summaries=self.schema_summaries,
             schema=self.db_config.schema,
         )
-        self._sync_graph_cache_and_vectors()
+        
+        if prewarm_complete:
+            # Skip graph card building - use cached cards
+            LOGGER.info("Using cached graph cards. Skipping graph card building.")
+        else:
+            self._sync_graph_cache_and_vectors()
         self.row_cap = self.db_config.sample_row_limit
 
         self.workflow = create_query_workflow(self.llm, self.engine)
@@ -592,17 +625,27 @@ class AnalyticsService:
             try:
                 cached = cached_metadata.get(table_name)
                 cached_hash = cached.get("schema_hash") if cached else None
-                # Empty hash indicates migration/invalidation - treat as cache miss
+                
+                # If hash is empty (from old migration), we'll recalculate and update it
+                # but still use cached description/samples if they exist
+                is_empty_hash = not cached_hash or cached_hash == ""
                 cache_hit = bool(cached and cached_hash and cached_hash == schema_hash)
-                if not cache_hit and cached_hash:
+                
+                if not cache_hit and cached_hash and not is_empty_hash:
                     LOGGER.warning(
                         "Schema hash mismatch for '%s': cached=%s current=%s. "
-                        "This may indicate schema changes or cache migration. "
-                        "Regenerating metadata.",
+                        "This may indicate schema changes. Regenerating metadata.",
                         table_name,
                         cached_hash[:16] if cached_hash else None,
                         schema_hash[:16] if schema_hash else None,
                     )
+                elif is_empty_hash and cached:
+                    LOGGER.info(
+                        "Recalculating hash for '%s' (was empty from migration). "
+                        "Using cached description/samples if schema unchanged.",
+                        table_name,
+                    )
+                
                 LOGGER.debug(
                     "Cache lookup for '%s': hit=%s cached_hash=%s current_hash=%s",
                     table_name,
@@ -610,10 +653,35 @@ class AnalyticsService:
                     cached_hash[:16] if cached_hash else None,
                     schema_hash[:16] if schema_hash else None,
                 )
-                if cache_hit and cached:
-                    samples: Dict[str, List[str]] = cached.get("samples") or {}
-                    description: Optional[str] = cached.get("description")
+                
+                # Use cached data if available
+                # If hash is empty (from migration), use cached data and just update hash
+                # If hash mismatches (schema changed), regenerate
+                if cached:
+                    cached_samples: Dict[str, List[str]] = cached.get("samples") or {}
+                    cached_description: Optional[str] = cached.get("description")
+                    
+                    if cache_hit:
+                        # Hash matches - use cached data
+                        samples = cached_samples
+                        description = cached_description
+                        LOGGER.debug("Cache hit for '%s' - using cached description/samples.", table_name)
+                    elif is_empty_hash:
+                        # Hash is empty (from migration) - use cached data, just update hash
+                        # This preserves descriptions/samples during migration
+                        samples = cached_samples
+                        description = cached_description
+                        LOGGER.info(
+                            "Using cached description/samples for '%s' (hash was empty, now updating to new hash).",
+                            table_name,
+                        )
+                    else:
+                        # Hash mismatches - schema likely changed, regenerate
+                        samples = {}
+                        description = None
+                        LOGGER.debug("Hash mismatch for '%s' - regenerating description/samples.", table_name)
                 else:
+                    # No cached data - need to generate
                     samples = {}
                     description = None
 
@@ -638,7 +706,10 @@ class AnalyticsService:
                 else:
                     LOGGER.debug("Reusing cached samples for table '%s'", table_name)
 
+                # Always upsert with new hash (updates hash even if description/samples unchanged)
                 self.metadata_cache.upsert(schema_cache_key, table_name, schema_hash, description, samples)
+                if is_empty_hash and description:
+                    LOGGER.debug("Updated hash for '%s' while preserving cached description/samples.", table_name)
                 LOGGER.debug("Persisted metadata for table '%s' into cache.", table_name)
 
                 columns = [
@@ -730,6 +801,112 @@ class AnalyticsService:
             except TypeError:
                 return default_schema()
         return ""
+
+    def _is_prewarm_complete(self) -> bool:
+        """
+        Check if prewarm cache exists and has substantial data.
+        Returns True if cache has metadata for multiple tables, indicating prewarm was run.
+        """
+        schema_key = self._schema_key()
+        schema_cache_key = schema_key or "(default)"
+        
+        # Check metadata cache
+        cached_metadata = self.metadata_cache.fetch_schema(schema_cache_key)
+        metadata_count = len([m for m in cached_metadata.values() if m.get("schema_hash") and m.get("description")])
+        
+        # Check graph cache
+        cached_tables = self.graph_cache.list_tables(schema_cache_key)
+        graph_count = len(cached_tables)
+        
+        # Consider prewarm complete if we have substantial cached data
+        # Require at least 10 tables or 50% of what we'd expect
+        is_complete = metadata_count >= 10 and graph_count >= 10
+        
+        if is_complete:
+            LOGGER.info(
+                "Prewarm cache check: Found %s cached metadata entries and %s cached graph tables.",
+                metadata_count,
+                graph_count,
+            )
+        else:
+            LOGGER.info(
+                "Prewarm cache check: Insufficient cache (metadata: %s, graph: %s). Will run full prewarm.",
+                metadata_count,
+                graph_count,
+            )
+        
+        return is_complete
+
+    def _hydrate_table_metadata_quick(self) -> None:
+        """
+        Quick hydration: Load metadata from cache only, skip LLM calls and sampling.
+        Used when prewarm cache exists.
+        """
+        schema_key = self._schema_key()
+        schema_cache_key = schema_key or "(default)"
+        summaries = self.schema_summaries
+        total_tables = len(summaries)
+        
+        if total_tables == 0:
+            LOGGER.info("No tables detected during quick metadata hydration.")
+            return
+
+        LOGGER.info(
+            "Quick hydration: Loading metadata from cache for %s tables in schema '%s'.",
+            total_tables,
+            schema_cache_key,
+        )
+
+        self.table_hashes = {summary.name: self._table_schema_hash(summary) for summary in summaries}
+        cached_metadata = self.metadata_cache.fetch_schema(schema_cache_key)
+        
+        # Load cached descriptions and samples into summaries
+        updated_summaries = []
+        cache_hits = 0
+        for summary in summaries:
+            table_name = summary.name
+            schema_hash = self.table_hashes.get(table_name)
+            if not schema_hash:
+                updated_summaries.append(summary)
+                continue
+                
+            cached = cached_metadata.get(table_name)
+            cached_hash = cached.get("schema_hash") if cached else None
+            # Skip entries with empty hashes (from old migration or invalid data)
+            if cached and cached_hash and cached_hash == schema_hash:
+                # Cache hit - load description and samples
+                description = cached.get("description")
+                samples = cached.get("samples") or {}
+                
+                # Update column samples
+                column_samples = {
+                    col.name: samples.get(col.name, [])
+                    for col in summary.columns
+                }
+                
+                # Create updated summary with cached data
+                updated_summary = replace(
+                    summary,
+                    description=description,
+                )
+                # Update column metadata with samples
+                updated_columns = [
+                    replace(col, sample_values=column_samples.get(col.name))
+                    for col in updated_summary.columns
+                ]
+                updated_summary = replace(updated_summary, columns=updated_columns)
+                updated_summaries.append(updated_summary)
+                cache_hits += 1
+            else:
+                # Cache miss - keep original summary
+                updated_summaries.append(summary)
+
+        self.schema_summaries = updated_summaries
+        LOGGER.info(
+            "Quick hydration complete: %s/%s tables loaded from cache.",
+            cache_hits,
+            total_tables,
+        )
 
     def _table_schema_hash(self, summary) -> str:
         # Sort columns by name for deterministic hashing
