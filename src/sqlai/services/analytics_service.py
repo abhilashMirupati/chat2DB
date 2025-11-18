@@ -478,7 +478,13 @@ class AnalyticsService:
                 for future in as_completed(futures):
                     table_name = futures[future]
                     try:
-                        future.result()
+                        # Add timeout to prevent hanging
+                        future.result(timeout=60.0)
+                    except TimeoutError:
+                        LOGGER.error(
+                            "Graph card building timed out (60s) for table '%s'. Skipping.",
+                            table_name,
+                        )
                     except Exception as exc:  # noqa: BLE001
                         LOGGER.error(
                             "Graph card building failed for table '%s': %s",
@@ -751,13 +757,24 @@ class AnalyticsService:
                 for future in as_completed(future_map):
                     idx, table_name = future_map[future]
                     try:
-                        updated_map[table_name] = future.result()
+                        # Add timeout to prevent hanging if LLM call is stuck
+                        # 120 seconds per table (60s lock wait + 60s LLM call)
+                        updated_map[table_name] = future.result(timeout=120.0)
                         # Count cache hits/misses
                         cached = cached_metadata.get(table_name)
                         if cached and cached.get("schema_hash") == self.table_hashes.get(table_name):
                             cache_hits += 1
                         else:
                             cache_misses += 1
+                    except TimeoutError:
+                        LOGGER.error(
+                            "Metadata hydration timed out (120s) for table '%s'. "
+                            "LLM call may be stuck. Skipping this table.",
+                            table_name,
+                        )
+                        # Continue with other tables - use original summary
+                        updated_map[table_name] = summaries[idx]
+                        cache_misses += 1
                     except Exception as exc:  # noqa: BLE001
                         LOGGER.exception(
                             "Unhandled exception hydrating table '%s': %s",
@@ -963,7 +980,27 @@ class AnalyticsService:
             f"Foreign keys:\n{fk_text}\n"
         )
         try:
-            with self._llm_lock:
+            # Acquire lock with timeout to prevent deadlock if another thread is stuck
+            # Use context manager to ensure lock is always released
+            lock_acquired = False
+            try:
+                # Try to acquire lock with timeout (60 seconds max wait)
+                # This prevents deadlock if another thread's LLM call hangs
+                lock_acquired = self._llm_lock.acquire(timeout=60.0)
+                if not lock_acquired:
+                    LOGGER.error(
+                        "Timeout waiting for LLM lock (60s) for table '%s'. "
+                        "Another thread may be stuck in LLM call. Skipping this table.",
+                        summary.name,
+                    )
+                    raise RuntimeError(
+                        f"Timeout waiting for LLM lock for table '{summary.name}'. "
+                        "Another thread may be stuck. Try reducing parallelism or check LLM connection."
+                    )
+                
+                # Make LLM call - if it hangs, at least other threads can timeout on lock acquisition
+                # Note: We can't interrupt a blocking LLM call, but the lock timeout prevents deadlock
+                LOGGER.debug("Acquired LLM lock for table '%s', making LLM call...", summary.name)
                 response = self.llm.invoke(
                     [
                         SystemMessage(
@@ -975,7 +1012,14 @@ class AnalyticsService:
                         HumanMessage(content=prompt),
                     ]
                 )
-            description = getattr(response, "content", None)
+                LOGGER.debug("LLM call completed for table '%s'", summary.name)
+                description = getattr(response, "content", None)
+            finally:
+                # CRITICAL: Always release lock, even if LLM call fails or hangs
+                # This prevents deadlock where all threads wait forever
+                if lock_acquired:
+                    self._llm_lock.release()
+                    LOGGER.debug("Released LLM lock for table '%s'", summary.name)
         except Exception as exc:  # noqa: BLE001
             LOGGER.error("LLM description generation failed for %s: %s", summary.name, exc, exc_info=True)
             raise RuntimeError(
