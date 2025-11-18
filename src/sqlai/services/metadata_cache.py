@@ -2,11 +2,14 @@ from __future__ import annotations
 
 import atexit
 import json
+import logging
 import sqlite3
 import threading
 import time
 from pathlib import Path
 from typing import Dict, Optional
+
+LOGGER = logging.getLogger(__name__)
 
 
 class MetadataCache:
@@ -32,8 +35,72 @@ class MetadataCache:
             )
             """
         )
+        # Add cache_version table for migration tracking
+        self.conn.execute(
+            """
+            CREATE TABLE IF NOT EXISTS cache_version (
+                key TEXT PRIMARY KEY,
+                value TEXT NOT NULL
+            )
+            """
+        )
+        self._migrate_cache_if_needed()
         self.conn.commit()
         atexit.register(self.conn.close)
+
+    def _migrate_cache_if_needed(self) -> None:
+        """
+        Check if cache needs migration due to hash algorithm changes.
+        If old unsorted hashes exist, invalidate them by clearing schema_hash.
+        """
+        CACHE_VERSION_KEY = "hash_algorithm_version"
+        CURRENT_VERSION = "2"  # Version 2 = sorted hash algorithm
+        
+        with self._lock:
+            try:
+                cursor = self.conn.execute(
+                    "SELECT value FROM cache_version WHERE key = ?",
+                    (CACHE_VERSION_KEY,),
+                )
+                row = cursor.fetchone()
+                stored_version = row[0] if row else None
+            except Exception as exc:  # noqa: BLE001
+                # If cache_version table doesn't exist or query fails, treat as no version
+                LOGGER.warning("Failed to read cache version, treating as unversioned: %s", exc)
+                stored_version = None
+            
+            if stored_version != CURRENT_VERSION:
+                # Migration needed - old hashes were calculated without sorting
+                # Clear all schema_hash values to force regeneration with new sorted algorithm
+                if stored_version is None:
+                    # First time - old cache exists, need to invalidate
+                    count = self.conn.execute("SELECT COUNT(*) FROM table_metadata").fetchone()[0]
+                    if count > 0:
+                        self.conn.execute("UPDATE table_metadata SET schema_hash = ''")
+                        self.conn.commit()
+                        LOGGER.info(
+                            "Cache migration: Invalidated %s old hash entries. "
+                            "Metadata will be regenerated with deterministic sorted hashes.",
+                            count,
+                        )
+                else:
+                    # Version mismatch - invalidate
+                    count = self.conn.execute("SELECT COUNT(*) FROM table_metadata").fetchone()[0]
+                    if count > 0:
+                        self.conn.execute("UPDATE table_metadata SET schema_hash = ''")
+                        self.conn.commit()
+                        LOGGER.info(
+                            "Cache migration: Invalidated %s hash entries due to version change. "
+                            "Metadata will be regenerated.",
+                            count,
+                        )
+                
+                # Update version
+                self.conn.execute(
+                    "INSERT OR REPLACE INTO cache_version (key, value) VALUES (?, ?)",
+                    (CACHE_VERSION_KEY, CURRENT_VERSION),
+                )
+                self.conn.commit()
 
     def fetch(self, schema: str, table_name: str) -> Optional[Dict[str, object]]:
         with self._lock:

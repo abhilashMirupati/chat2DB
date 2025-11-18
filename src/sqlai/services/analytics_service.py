@@ -393,7 +393,8 @@ class AnalyticsService:
             if not schema_hash:
                 continue
             cached_hash = cached_hashes.get(table_name)
-            if cached_hash == schema_hash:
+            # Empty hash indicates migration/invalidation - treat as cache miss
+            if cached_hash and cached_hash == schema_hash:
                 continue  # Cache hit, skip
             summaries_to_process.append(summary)
             tables_to_refresh.append(table_name)
@@ -591,11 +592,12 @@ class AnalyticsService:
             try:
                 cached = cached_metadata.get(table_name)
                 cached_hash = cached.get("schema_hash") if cached else None
-                cache_hit = bool(cached and cached_hash == schema_hash)
+                # Empty hash indicates migration/invalidation - treat as cache miss
+                cache_hit = bool(cached and cached_hash and cached_hash == schema_hash)
                 if not cache_hit and cached_hash:
                     LOGGER.warning(
                         "Schema hash mismatch for '%s': cached=%s current=%s. "
-                        "This may indicate schema changes or non-deterministic hash calculation. "
+                        "This may indicate schema changes or cache migration. "
                         "Regenerating metadata.",
                         table_name,
                         cached_hash[:16] if cached_hash else None,
@@ -731,31 +733,38 @@ class AnalyticsService:
 
     def _table_schema_hash(self, summary) -> str:
         # Sort columns by name for deterministic hashing
-        sorted_columns = sorted(summary.columns, key=lambda c: c.name)
+        # Handle empty columns list gracefully
+        columns = summary.columns or []
+        sorted_columns = sorted(columns, key=lambda c: c.name)
         payload_parts = [
             f"{column.name}:{column.type}:{column.nullable}"
             for column in sorted_columns
         ]
+        # Handle foreign keys - check for None and empty list
         if summary.foreign_keys:
             # Sort foreign keys by their string representation for deterministic hashing
             # Also ensure FK column lists are sorted in the hash
             sorted_fks = sorted(
                 summary.foreign_keys,
                 key=lambda fk: (
-                    ",".join(sorted(fk.constrained_columns)),
+                    ",".join(sorted(fk.constrained_columns or [])),
                     fk.referred_schema or "",
-                    fk.referred_table,
-                    ",".join(sorted(fk.referred_columns)),
+                    fk.referred_table or "",
+                    ",".join(sorted(fk.referred_columns or [])),
                 ),
             )
             # Format FK with sorted columns for deterministic hash
             for fk in sorted_fks:
-                left = ",".join(sorted(fk.constrained_columns))
+                # Defensive: handle None/empty lists
+                constrained = sorted(fk.constrained_columns or [])
+                referred = sorted(fk.referred_columns or [])
+                left = ",".join(constrained)
                 right_schema = f"{fk.referred_schema}." if fk.referred_schema else ""
-                right = ",".join(sorted(fk.referred_columns))
-                fk_str = f"fk:[{left}] -> {right_schema}{fk.referred_table}.[{right}]"
+                right = ",".join(referred)
+                fk_str = f"fk:[{left}] -> {right_schema}{fk.referred_table or ''}.[{right}]"
                 payload_parts.append(fk_str)
-        payload = "|".join(payload_parts).encode("utf-8")
+        # Handle empty payload (table with no columns) - still produce a hash
+        payload = "|".join(payload_parts).encode("utf-8") if payload_parts else b""
         return hashlib.sha256(payload).hexdigest()
 
     def _generate_table_description(self, summary) -> str:
