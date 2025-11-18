@@ -376,18 +376,99 @@ class AnalyticsService:
             self.graph_cache.delete_tables(schema_key, removed_tables)
             self.vector_store.delete_tables(schema_key, removed_tables)
 
+        # Pre-load all cached hashes in one query
+        cached_hashes = self.graph_cache.get_schema_hashes(schema_key)
+        LOGGER.info(
+            "Loaded %s cached graph card table(s) from schema '%s' for comparison.",
+            len(cached_hashes),
+            schema_key,
+        )
+
+        # Identify tables that need refresh (hash mismatch or missing)
         tables_to_refresh: List[str] = []
+        summaries_to_process: List[TableSummary] = []
         for summary in self.schema_summaries:
             table_name = summary.name
             schema_hash = self.table_hashes.get(table_name)
             if not schema_hash:
                 continue
-            cached_hash = self.graph_cache.get_table_hash(schema_key, table_name)
+            cached_hash = cached_hashes.get(table_name)
             if cached_hash == schema_hash:
-                continue
-            records = self._build_graph_card_records(schema_key, table_name, schema_hash)
-            self.graph_cache.replace_table_cards(schema_key, table_name, schema_hash, records)
+                continue  # Cache hit, skip
+            summaries_to_process.append(summary)
             tables_to_refresh.append(table_name)
+
+        if not summaries_to_process:
+            LOGGER.info(
+                "All %s table(s) already have cached graph cards with matching schema hashes. Skipping graph card building.",
+                len(self.schema_summaries),
+            )
+            return
+
+        LOGGER.info(
+            "Building graph cards for %s table(s) that need refresh.",
+            len(summaries_to_process),
+        )
+
+        # Parallelize graph card building
+        total_tables = len(summaries_to_process)
+        if total_tables > 20:
+            max_workers = min(8, total_tables)
+            LOGGER.info(
+                "Using ThreadPoolExecutor with %s worker(s) for graph card building.",
+                max_workers,
+            )
+
+            def process_table(summary: TableSummary) -> None:
+                table_name = summary.name
+                schema_hash = self.table_hashes.get(table_name)
+                if not schema_hash:
+                    LOGGER.warning("No schema hash found for table '%s', skipping graph card building.", table_name)
+                    return
+                try:
+                    records = self._build_graph_card_records(schema_key, table_name, schema_hash)
+                    self.graph_cache.replace_table_cards(schema_key, table_name, schema_hash, records)
+                except Exception as exc:  # noqa: BLE001
+                    LOGGER.exception(
+                        "Failed to build graph cards for table '%s': %s",
+                        table_name,
+                        exc,
+                    )
+                    raise
+
+            with ThreadPoolExecutor(max_workers=max_workers) as executor:
+                futures = {
+                    executor.submit(process_table, summary): summary.name
+                    for summary in summaries_to_process
+                }
+                for future in as_completed(futures):
+                    table_name = futures[future]
+                    try:
+                        future.result()
+                    except Exception as exc:  # noqa: BLE001
+                        LOGGER.error(
+                            "Graph card building failed for table '%s': %s",
+                            table_name,
+                            exc,
+                        )
+        else:
+            # Sequential for small batches
+            for summary in summaries_to_process:
+                table_name = summary.name
+                schema_hash = self.table_hashes.get(table_name)
+                if not schema_hash:
+                    LOGGER.warning("No schema hash found for table '%s', skipping graph card building.", table_name)
+                    continue
+                try:
+                    records = self._build_graph_card_records(schema_key, table_name, schema_hash)
+                    self.graph_cache.replace_table_cards(schema_key, table_name, schema_hash, records)
+                except Exception as exc:  # noqa: BLE001
+                    LOGGER.exception(
+                        "Failed to build graph cards for table '%s': %s",
+                        table_name,
+                        exc,
+                    )
+                    raise
 
         if tables_to_refresh:
             LOGGER.info(
@@ -479,7 +560,7 @@ class AnalyticsService:
 
     def _hydrate_table_metadata(self) -> None:
         schema_key = self._schema_key()
-        schema_cache_key = schema_key or ""
+        schema_cache_key = schema_key or "(default)"  # Consistent with other methods
         summaries = self.schema_summaries
         total_tables = len(summaries)
         if total_tables == 0:
@@ -489,15 +570,23 @@ class AnalyticsService:
         LOGGER.info(
             "Hydrating metadata for %s tables in schema '%s'.",
             total_tables,
-            schema_key or "(default)",
+            schema_cache_key,
         )
 
         self.table_hashes = {summary.name: self._table_schema_hash(summary) for summary in summaries}
         cached_metadata = self.metadata_cache.fetch_schema(schema_cache_key)
+        LOGGER.info(
+            "Loaded %s cached table(s) from schema '%s' for comparison.",
+            len(cached_metadata),
+            schema_cache_key,
+        )
 
         def process_summary(summary: TableSummary) -> TableSummary:
             table_name = summary.name
-            schema_hash = self.table_hashes[table_name]
+            schema_hash = self.table_hashes.get(table_name)
+            if not schema_hash:
+                LOGGER.warning("No schema hash found for table '%s', skipping metadata hydration.", table_name)
+                return summary
             LOGGER.debug("Starting metadata hydration for table '%s'", table_name)
             try:
                 cached = cached_metadata.get(table_name)
@@ -562,6 +651,9 @@ class AnalyticsService:
                 )
                 raise
 
+        cache_hits = 0
+        cache_misses = 0
+        
         if total_tables > 50:
             max_workers = min(5, total_tables)
             LOGGER.info(
@@ -578,6 +670,12 @@ class AnalyticsService:
                     idx, table_name = future_map[future]
                     try:
                         updated_map[table_name] = future.result()
+                        # Count cache hits/misses
+                        cached = cached_metadata.get(table_name)
+                        if cached and cached.get("schema_hash") == self.table_hashes.get(table_name):
+                            cache_hits += 1
+                        else:
+                            cache_misses += 1
                     except Exception as exc:  # noqa: BLE001
                         LOGGER.exception(
                             "Unhandled exception hydrating table '%s': %s",
@@ -585,14 +683,29 @@ class AnalyticsService:
                             exc,
                         )
                         updated_map[table_name] = summaries[idx]
+                        cache_misses += 1
             updated_summaries = [
                 updated_map.get(summary.name, summary) for summary in summaries
             ]
         else:
-            updated_summaries = [process_summary(summary) for summary in summaries]
+            updated_summaries = []
+            for summary in summaries:
+                result = process_summary(summary)
+                updated_summaries.append(result)
+                # Count cache hits/misses
+                cached = cached_metadata.get(summary.name)
+                if cached and cached.get("schema_hash") == self.table_hashes.get(summary.name):
+                    cache_hits += 1
+                else:
+                    cache_misses += 1
 
         self.schema_summaries = updated_summaries
-        LOGGER.info("Metadata hydration complete for %s table(s).", total_tables)
+        LOGGER.info(
+            "Metadata hydration complete for %s table(s). Cache hits: %s, Cache misses: %s",
+            total_tables,
+            cache_hits,
+            cache_misses,
+        )
 
     def _schema_key(self) -> str:
         if self.db_config.schema:
@@ -613,8 +726,9 @@ class AnalyticsService:
             for column in summary.columns
         ]
         if summary.foreign_keys:
+            # Use consistent FK formatting for hash stability
             payload_parts.extend(
-                [f"fk:{fk}" for fk in summary.foreign_keys]
+                [f"fk:{_format_fk_detail(fk)}" for fk in summary.foreign_keys]
             )
         payload = "|".join(payload_parts).encode("utf-8")
         return hashlib.sha256(payload).hexdigest()

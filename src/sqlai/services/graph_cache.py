@@ -76,6 +76,23 @@ class GraphCache:
             row = cursor.fetchone()
         return row[0] if row else None
 
+    def get_schema_hashes(self, schema: str) -> Dict[str, str]:
+        """
+        Return all cached schema hashes for a schema in a single query.
+        Returns dict mapping table_name -> schema_hash.
+        """
+        with self._lock:
+            cursor = self.conn.execute(
+                """
+                SELECT DISTINCT table_name, schema_hash
+                FROM graph_cards
+                WHERE schema_name = ? AND card_type = 'table'
+                """,
+                (schema,),
+            )
+            rows = cursor.fetchall()
+        return {row[0]: row[1] for row in rows}
+
     def replace_table_cards(
         self,
         schema: str,
