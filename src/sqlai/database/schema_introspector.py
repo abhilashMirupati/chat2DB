@@ -4,6 +4,7 @@ Schema introspection helpers for summarising databases.
 
 from __future__ import annotations
 
+from concurrent.futures import ThreadPoolExecutor, as_completed
 from dataclasses import dataclass
 from typing import Iterable, List, Optional
 
@@ -52,13 +53,21 @@ def introspect_database(
     inspector = inspect(engine)
     schema_name = schema or inspector.default_schema_name
     table_names = inspector.get_table_names(schema=schema_name)
-    summaries: List[TableSummary] = []
     dialect = getattr(engine.dialect, "name", "").lower()
-    for table in table_names:
-        if not include_system_tables and _is_system_table(table, dialect):
-            continue
+
+    filtered_tables = [
+        table
+        for table in table_names
+        if include_system_tables or not _is_system_table(table, dialect)
+    ]
+
+    if not filtered_tables:
+        return []
+
+    def _collect(table_name: str) -> TableSummary:
+        local_inspector = inspect(engine)
         column_info: List[ColumnMetadata] = []
-        for column in inspector.get_columns(table, schema=schema_name):
+        for column in local_inspector.get_columns(table_name, schema=schema_name):
             column_info.append(
                 ColumnMetadata(
                     name=column["name"],
@@ -69,7 +78,7 @@ def introspect_database(
                 )
             )
         foreign_keys: List[ForeignKeyDetail] = []
-        for fk in inspector.get_foreign_keys(table, schema=schema_name):
+        for fk in local_inspector.get_foreign_keys(table_name, schema=schema_name):
             foreign_keys.append(
                 ForeignKeyDetail(
                     constrained_columns=fk.get("constrained_columns", []),
@@ -78,17 +87,32 @@ def introspect_database(
                     referred_columns=fk.get("referred_columns", []),
                 )
             )
-        table_comment = inspector.get_table_comment(table, schema=schema_name) or {}
-        summaries.append(
-            TableSummary(
-                name=table,
-                columns=column_info,
-                foreign_keys=foreign_keys,
-                row_estimate=_estimate_row_count(inspector, table, schema_name),
-                comment=table_comment.get("text"),
-            )
+        table_comment = local_inspector.get_table_comment(table_name, schema=schema_name) or {}
+        return TableSummary(
+            name=table_name,
+            columns=column_info,
+            foreign_keys=foreign_keys,
+            row_estimate=_estimate_row_count(local_inspector, table_name, schema_name),
+            comment=table_comment.get("text"),
         )
-    return summaries
+
+    if len(filtered_tables) <= 30:
+        return [_collect(table) for table in filtered_tables]
+
+    max_workers = min(8, len(filtered_tables))
+    summary_map: dict[str, TableSummary] = {}
+    with ThreadPoolExecutor(max_workers=max_workers) as executor:
+        future_map = {
+            executor.submit(_collect, table): table for table in filtered_tables
+        }
+        for future in as_completed(future_map):
+            table = future_map[future]
+            try:
+                summary_map[table] = future.result()
+            except Exception as exc:  # noqa: BLE001
+                raise RuntimeError(f"Failed to introspect table '{table}': {exc}") from exc
+
+    return [summary_map[table] for table in filtered_tables if table in summary_map]
 
 
 def introspection_dataframe(summaries: Iterable[TableSummary]) -> pd.DataFrame:
