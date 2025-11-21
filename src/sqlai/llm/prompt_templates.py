@@ -176,13 +176,15 @@ CRITIC_PROMPT = ChatPromptTemplate.from_messages([
         "- Check schema correctness (tables/columns/aliases), FK joins, cartesian avoidance.\n"
         "- Check dialect compliance and pagination rules.\n"
         "- Use the error message to pinpoint the failing clause.\n"
+        "- **CRITICAL: Validate that the SQL results correctly answer the user's question.** Check if the SELECT columns, WHERE filters, GROUP BY, and aggregations match what the question asks for.\n"
+        "- **Self-critique: Verify the SQL will produce results that directly address the user's intent.** If the SQL doesn't answer the question, reject it even if it's syntactically correct.\n"
         "- Ignore visualization/chart requests when judging SQL; charts are handled outside SQL.\n"
         "- Reject and remove any non-data 'probe' statements (e.g., SELECT 'pie' FROM dual) that are unrelated to answering the question.\n"
         "- Use the Graph Context thoroughly: map aliases → tables; verify alias.table.column existence; identify the correct FK join path that should be used.\n"
         "- Provide specific, schema-grounded hints that name the exact alias.table.column to fix and the exact JOIN to add or adjust.\n"
         "Return strict JSON with keys:\n"
         '  "verdict": "accept" | "reject",\n'
-        '  "reasons": [string...],  // each reason should reference exact alias.table.column and/or FK path\n'
+        '  "reasons": [string...],  // each reason should reference exact alias.table.column and/or FK path, and whether SQL answers the question\n'
         '  "repair_hints": [string...]  // each hint should be an explicit edit: JOIN to add, alias to qualify, column to move\n'
         "Return strict JSON: use double quotes only, no trailing commas, no comments.",
     ),

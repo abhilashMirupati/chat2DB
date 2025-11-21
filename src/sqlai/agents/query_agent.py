@@ -988,7 +988,13 @@ def _summarise(llm: Any):
                 "Answer precisely and, if charts are requested, ensure the chart specification is consistent "
                 "with the data. You must always produce a summary, even if some fields appear missing or look "
                 "like template placeholders (e.g. {question}). When information is absent, make a best-effort "
-                "inference and explicitly note the gap rather than refusing.",
+                "inference and explicitly note the gap rather than refusing.\n\n"
+                "**CRITICAL: Self-critique your summary**\n"
+                "- Verify that your summary directly answers the user's question.\n"
+                "- Check that the key information requested in the question is present in your answer.\n"
+                "- Ensure your answer matches the user's intent, not just the SQL results.\n"
+                "- If the results don't fully answer the question, acknowledge what's missing.\n"
+                "- Before finalizing, ask yourself: 'Does this answer what the user asked for?'",
             ),
             (
                 "human",
@@ -996,7 +1002,8 @@ def _summarise(llm: Any):
                 "Plan rationale: {rationale}\n\n"
                 "SQL:\n{sql}\n\n"
                 "Table preview:\n{preview}\n\n"
-                "If a chart specification was provided, repeat it and explain it briefly.",
+                "If a chart specification was provided, repeat it and explain it briefly.\n\n"
+                "**Remember: Your summary must directly answer the user's question above.**",
             ),
         ]
     )

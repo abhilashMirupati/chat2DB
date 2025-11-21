@@ -117,3 +117,31 @@ class ConversationCache:
             "created_at": row[7],
         }
 
+    def get_recent_questions(self, schema: str, limit: int = 20) -> List[Dict[str, object]]:
+        """
+        Get recent questions for similarity checking.
+        Returns questions with their SQL for semantic comparison.
+        """
+        with self._lock:
+            cursor = self.conn.execute(
+                """
+                SELECT id, question, sql_text, summary_text, created_at
+                FROM saved_queries
+                WHERE schema_name = ?
+                ORDER BY created_at DESC
+                LIMIT ?
+                """,
+                (schema, limit),
+            )
+            rows = cursor.fetchall()
+        return [
+            {
+                "id": row[0],
+                "question": row[1],
+                "sql": row[2],
+                "summary": row[3],
+                "created_at": row[4],
+            }
+            for row in rows
+        ]
+

@@ -176,6 +176,20 @@ class AppConfig(BaseSettings):
         description="If True, skip expensive prewarm steps (LLM calls, sampling) when cache exists. "
         "Set to False to force refresh or if cache is stale.",
     )
+    fk_expansion_max_depth: int = Field(
+        default=3,
+        description="Maximum depth for FK expansion (multi-hop traversal). "
+        "1=direct only, 2=1-hop, 3=2-hop, etc. Higher values include more connected tables.",
+        ge=1,
+        le=5,
+    )
+    fk_expansion_max_tables: int = Field(
+        default=20,
+        description="Maximum number of additional tables to add via FK expansion. "
+        "Prevents context explosion in highly connected schemas.",
+        ge=5,
+        le=50,
+    )
 
     model_config = SettingsConfigDict(
         env_prefix="SQLAI_",

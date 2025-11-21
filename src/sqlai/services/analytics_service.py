@@ -14,6 +14,8 @@ from typing import Any, Dict, List, Optional, Sequence
 import pandas as pd
 
 from langchain_core.messages import HumanMessage, SystemMessage
+from langchain_core.output_parsers import JsonOutputParser
+from langchain_core.prompts import ChatPromptTemplate
 
 from sqlai.agents.query_agent import (
     create_query_workflow,
@@ -199,10 +201,151 @@ class AnalyticsService:
     def has_schema(self) -> bool:
         return bool(self.schema_summaries)
 
-    def ask(self, question: str) -> Dict[str, Any]:
+    def _check_similar_questions(
+        self,
+        question: str,
+        similarity_threshold: float = 0.75,
+    ) -> Optional[Dict[str, Any]]:
+        """
+        Check if a similar question was asked before.
+        Returns the most similar question with its SQL if found, None otherwise.
+        """
+        schema_key = self._schema_key() or "(default)"
+        
+        # Get recent questions from cache
+        recent_queries = self.conversation_cache.get_recent_questions(schema_key, limit=20)
+        if not recent_queries:
+            return None
+        
+        # Use semantic similarity if embedding provider is available
+        if self.semantic_retriever and self.semantic_retriever.provider:
+            try:
+                # Get all previous questions
+                previous_questions = [q["question"] for q in recent_queries]
+                
+                # Calculate similarities
+                similarities = self.semantic_retriever.provider.similarities(
+                    question,
+                    previous_questions
+                )
+                
+                # Find the best match
+                best_match_idx = None
+                best_score = 0.0
+                for idx, score in enumerate(similarities):
+                    if score > best_score and score >= similarity_threshold:
+                        best_score = score
+                        best_match_idx = idx
+                
+                if best_match_idx is not None:
+                    matched_query = recent_queries[best_match_idx]
+                    LOGGER.info(
+                        "Found similar question: '%s' (similarity: %.3f)",
+                        matched_query["question"],
+                        best_score
+                    )
+                    return {
+                        "matched_question": matched_query["question"],
+                        "matched_sql": matched_query["sql"],
+                        "matched_summary": matched_query.get("summary"),
+                        "similarity_score": best_score,
+                        "entry_id": matched_query["id"],
+                    }
+            except Exception as exc:
+                LOGGER.warning("Semantic similarity check failed: %s", exc)
+        
+        # Fallback: simple string similarity for exact/very similar matches
+        question_lower = question.lower().strip()
+        for query in recent_queries:
+            prev_question_lower = query["question"].lower().strip()
+            # Check for exact match or very high similarity
+            if question_lower == prev_question_lower:
+                LOGGER.info("Found exact match: '%s'", query["question"])
+                return {
+                    "matched_question": query["question"],
+                    "matched_sql": query["sql"],
+                    "matched_summary": query.get("summary"),
+                    "similarity_score": 1.0,
+                    "entry_id": query["id"],
+                }
+        
+        return None
+
+    def _check_intent_same(
+        self,
+        current_question: str,
+        previous_question: str,
+        previous_sql: str,
+    ) -> Dict[str, Any]:
+        """
+        Use LLM to check if the user intent is the same between two questions.
+        Returns a dict with 'is_same' boolean and 'confidence' score.
+        """
+        prompt = ChatPromptTemplate.from_messages([
+            (
+                "system",
+                "You are an expert at understanding user intent in database queries. "
+                "Compare two questions and determine if they have the SAME intent, even if worded differently.\n\n"
+                "Consider:\n"
+                "- Do they ask for the same information?\n"
+                "- Do they use the same filters/criteria?\n"
+                "- Do they have the same aggregation/grouping requirements?\n"
+                "- Are they asking about the same entities/tables?\n\n"
+                "Return JSON with:\n"
+                '  "is_same": true/false,\n'
+                '  "confidence": 0.0-1.0 (how confident you are),\n'
+                '  "reason": "brief explanation"\n'
+                "Return strict JSON only, no prose.",
+            ),
+            (
+                "human",
+                "Previous question: {previous_question}\n\n"
+                "Previous SQL: {previous_sql}\n\n"
+                "Current question: {current_question}\n\n"
+                "Do these questions have the SAME intent? Return JSON.",
+            ),
+        ])
+        
+        try:
+            chain = prompt | self.llm | JsonOutputParser()
+            result = chain.invoke({
+                "previous_question": previous_question,
+                "previous_sql": previous_sql,
+                "current_question": current_question,
+            })
+            
+            return {
+                "is_same": result.get("is_same", False),
+                "confidence": result.get("confidence", 0.0),
+                "reason": result.get("reason", ""),
+            }
+        except Exception as exc:
+            LOGGER.warning("Intent matching failed: %s", exc)
+            return {
+                "is_same": False,
+                "confidence": 0.0,
+                "reason": f"Error: {exc}",
+            }
+
+    def ask(self, question: str, skip_similarity_check: bool = False) -> Dict[str, Any]:
         """
         Execute the LangGraph workflow end-to-end.
+        
+        Args:
+            question: User's natural language question
+            skip_similarity_check: If True, skip checking for similar questions (for testing or forced regeneration)
+        
+        Returns:
+            Dict with answer, chart, SQL, and execution results
+            OR a confirmation dict if similar question found
         """
+        question = question.strip()
+        if not question:
+            return {
+                "answer": {"text": "Please provide a question."},
+                "chart": None,
+                "followups": [],
+            }
 
         if not self.schema_summaries:
             raise ValueError(
@@ -210,10 +353,51 @@ class AnalyticsService:
                 "Try specifying a schema or enabling system tables in the sidebar."
             )
 
+        # Step 1: Check for similar questions (unless skipped)
+        if not skip_similarity_check:
+            similar = self._check_similar_questions(question, similarity_threshold=0.75)
+            if similar:
+                # Step 2: Use LLM to verify intent is the same
+                intent_check = self._check_intent_same(
+                    current_question=question,
+                    previous_question=similar["matched_question"],
+                    previous_sql=similar["matched_sql"],
+                )
+                
+                if intent_check["is_same"] and intent_check["confidence"] >= 0.7:
+                    # Return confirmation response
+                    LOGGER.info(
+                        "Similar question found with same intent (confidence: %.2f): '%s'",
+                        intent_check["confidence"],
+                        similar["matched_question"]
+                    )
+                    return {
+                        "similar_question_found": True,
+                        "matched_question": similar["matched_question"],
+                        "matched_sql": similar["matched_sql"],
+                        "matched_summary": similar.get("matched_summary"),
+                        "similarity_score": similar["similarity_score"],
+                        "intent_confidence": intent_check["confidence"],
+                        "intent_reason": intent_check["reason"],
+                        "entry_id": similar["entry_id"],
+                        "confirmation_required": True,
+                        "answer": {
+                            "text": (
+                                f"I found a similar question you asked before:\n\n"
+                                f"**Previous question:** {similar['matched_question']}\n\n"
+                                f"**Your current question:** {question}\n\n"
+                                f"These appear to have the same intent (confidence: {intent_check['confidence']:.0%}).\n\n"
+                                f"Would you like me to reuse the previous SQL query, or generate a new one?"
+                            ),
+                        },
+                    }
+
         LOGGER.info("Received question: %s", question)
         retrieval = self.semantic_retriever.select_cards(
             graph=self.graph_context,
             question=question,
+            fk_expansion_max_depth=self.app_config.fk_expansion_max_depth,
+            fk_expansion_max_tables=self.app_config.fk_expansion_max_tables,
         )
         LOGGER.debug("Retrieval details: %s", retrieval.details)
         value_anchor_text = self._build_value_anchors(retrieval.tables)

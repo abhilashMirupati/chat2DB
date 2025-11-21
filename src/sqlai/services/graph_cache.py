@@ -78,7 +78,8 @@ class GraphCache:
 
     def _cleanup_empty_hashes(self) -> None:
         """
-        Remove any cache entries with empty schema_hash (from old migrations or invalid data).
+        Check for cache entries with empty schema_hash (from old migrations or invalid data).
+        Only logs warnings - does not delete any data.
         """
         with self._lock:
             cursor = self.conn.execute(
@@ -86,17 +87,16 @@ class GraphCache:
             )
             count = cursor.fetchone()[0]
             if count > 0:
-                self.conn.execute("DELETE FROM graph_cards WHERE schema_hash = '' OR schema_hash IS NULL")
-                self.conn.commit()
-                LOGGER.info(
-                    "Cleaned up %s graph cache entries with empty or null schema_hash.",
+                LOGGER.warning(
+                    "Found %s graph cache entries with empty or null schema_hash. "
+                    "These may need regeneration. Run prewarm_metadata.py to fix.",
                     count,
                 )
 
     def _migrate_cache_if_needed(self) -> None:
         """
         Check if cache needs migration due to hash algorithm changes.
-        If old unsorted hashes exist, invalidate them by clearing schema_hash.
+        Only logs warnings - does not modify or delete any data.
         """
         CACHE_VERSION_KEY = "hash_algorithm_version"
         CURRENT_VERSION = "2"  # Version 2 = sorted hash algorithm
@@ -111,42 +111,24 @@ class GraphCache:
                 stored_version = row[0] if row else None
             except Exception as exc:  # noqa: BLE001
                 # If cache_version table doesn't exist or query fails, treat as no version
-                LOGGER.warning("Failed to read cache version, treating as unversioned: %s", exc)
                 stored_version = None
             
             if stored_version != CURRENT_VERSION:
-                # Migration needed - old hashes were calculated without sorting
-                # Delete all entries to force regeneration with new sorted algorithm
-                # (Better than setting empty hash - avoids confusion)
-                if stored_version is None:
-                    # First time - old cache exists, need to invalidate
-                    count = self.conn.execute("SELECT COUNT(*) FROM graph_cards").fetchone()[0]
-                    if count > 0:
-                        self.conn.execute("DELETE FROM graph_cards")
-                        self.conn.commit()
-                        LOGGER.info(
-                            "Graph cache migration: Deleted %s old hash entries. "
-                            "Graph cards will be regenerated with deterministic sorted hashes.",
+                # Migration may be needed - just log a warning, don't modify data
+                count = self.conn.execute("SELECT COUNT(*) FROM graph_cards").fetchone()[0]
+                if count > 0:
+                    if stored_version is None:
+                        LOGGER.warning(
+                            "Graph cache version not set. Found %s graph card entries. "
+                            "Hashes may need recalculation. Run prewarm_metadata.py to update.",
                             count,
                         )
-                else:
-                    # Version mismatch - invalidate
-                    count = self.conn.execute("SELECT COUNT(*) FROM graph_cards").fetchone()[0]
-                    if count > 0:
-                        self.conn.execute("DELETE FROM graph_cards")
-                        self.conn.commit()
-                        LOGGER.info(
-                            "Graph cache migration: Deleted %s hash entries due to version change. "
-                            "Graph cards will be regenerated.",
-                            count,
+                    else:
+                        LOGGER.warning(
+                            "Graph cache version mismatch (stored: %s, current: %s). Found %s graph card entries. "
+                            "Hashes may need recalculation. Run prewarm_metadata.py to update.",
+                            stored_version, CURRENT_VERSION, count,
                         )
-                
-                # Update version
-                self.conn.execute(
-                    "INSERT OR REPLACE INTO cache_version (key, value) VALUES (?, ?)",
-                    (CACHE_VERSION_KEY, CURRENT_VERSION),
-                )
-                self.conn.commit()
 
     def get_table_hash(self, schema: str, table_name: str) -> Optional[str]:
         with self._lock:

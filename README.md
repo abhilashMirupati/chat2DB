@@ -28,18 +28,24 @@ SQLAI is designed for enterprise teams who need trustworthy, self-healing SQL ge
 ---
 ## Architecture
 
+**Graph-RAG with Flat Storage:**
+- Graph representation in memory (TableCard nodes, RelationshipCard edges, ColumnCard properties)
+- Flat storage in SQLite (graph cards cached as records, not native graph database)
+- Graph traversal via Python BFS (multi-hop FK expansion)
+- Semantic retrieval with graph-aware context building
+
 ```mermaid
 flowchart TD
     A[Launch UI or prewarm script] --> B[Load configs & validate]
     B --> C[Introspect schema\n(sqlalchemy.inspect)]
     C --> D[Hydrate metadata\nLLM descriptions + samples]
     D --> E[Build GraphContext\nTable/Column/Relationship cards]
-    E --> F[Persist graph cards\nSQLite cache]
+    E --> F[Persist graph cards\nSQLite cache - flat storage]
     F --> G[Embed table cards only\nChroma namespace per model]
     G --> H[User question\nStreamlit UI]
     H --> I[SemanticRetriever\nTable-only search]
     I --> I1[Stage 1: Semantic search\nTable cards only]
-    I1 --> I2[Stage 2: FK expansion\nAdd referenced tables]
+    I1 --> I2[Stage 2: Multi-hop FK expansion\nBFS traversal up to max_depth]
     I2 --> I3[Stage 3: Get ALL columns\nfor selected tables]
     I3 --> I4[Stage 4: Get ALL relationships\nfor selected tables]
     I4 --> J[Planner LLM\nLangGraph plan node]
@@ -55,6 +61,12 @@ flowchart TD
 - **TableCard**: Table name, schema, LLM-generated description, row estimate, trimmed column list
 - **ColumnCard**: Column name, type, nullable/default, sample values (5), comments
 - **RelationshipCard**: Foreign key relationships (FK edges between tables)
+
+**Storage Architecture:**
+- **In-Memory**: Graph structure (nodes/edges) as Python objects (`GraphContext`)
+- **SQLite Cache**: Flat records storing graph cards as text/metadata (not native graph DB)
+- **ChromaDB**: Vector embeddings of table cards for semantic search
+- **Graph Traversal**: Python BFS algorithm for multi-hop FK expansion (not Cypher queries)
 
 **Caches & storage**
 - `.cache/table_metadata.db` – table descriptions + column samples (LLM-generated).
@@ -72,7 +84,7 @@ flowchart TD
 | Graph & vector caches | Persist rendered cards, embed table cards via Chroma, support warm restarts | `graph_cache.py`, `vector_store.py` |
 | LangGraph workflow | Planner, intent critic/repair, execution node, post critic/repair, summariser | `src/sqlai/agents/query_agent.py` |
 | Guardrails | SQLGlot transpilation, deterministic SQL validation/repair (row caps, dialect rewrites, literal alignment) | `src/sqlai/guards/sql_guard.py`, `src/sqlai/utils/sql_transpiler.py` |
-| Retrieval | Two-stage: table-only semantic search → FK expansion → get ALL columns/relationships | `src/sqlai/semantic/retriever.py` |
+| Retrieval | Multi-stage: table-only semantic search → multi-hop FK expansion (BFS) → get ALL columns/relationships | `src/sqlai/semantic/retriever.py` |
 | Graph Context | TableCard, ColumnCard, RelationshipCard builders and formatters | `src/sqlai/graph/context.py` |
 
 ---
@@ -99,6 +111,21 @@ pip install -e ".[openai,anthropic,ollama,huggingface]"
 pip install chromadb
 ```
 
+### Install test dependencies
+```bash
+pip install -e ".[test]"
+```
+
+### Run tests
+```bash
+pytest tests/ -v
+```
+
+To run a specific test file:
+```bash
+pytest tests/test_fk_expansion.py -v
+```
+
 ---
 ## Configuration
 
@@ -121,6 +148,10 @@ SQLAI_VECTOR_PROVIDER=chroma
 # Optional overrides:
 # SQLAI_VECTOR_PATH=.cache/vector_store
 # SQLAI_VECTOR_COLLECTION=graph_cards
+
+# FK Expansion Configuration (Multi-hop traversal)
+SQLAI_FK_EXPANSION_MAX_DEPTH=3          # Maximum hop depth (1=direct only, 2=1-hop, 3=2-hop, etc.)
+SQLAI_FK_EXPANSION_MAX_TABLES=20        # Maximum additional tables to add via FK expansion
 
 SQLAI_LOG_LEVEL=INFO
 SQLAI_BRAND_NAME=Silpa Analytics Lab
@@ -194,12 +225,18 @@ Rendered cards are cached in `.cache/graph_cards.db` and **only table cards are 
    - Merge results: combines heuristic + semantic + vector scores
    - Select top-K tables (default: 6)
 
-2. **Stage 2: FK Expansion** (1-hop expansion)
-   - Automatically includes tables referenced by foreign keys
+2. **Stage 2: Multi-Hop FK Expansion** (BFS traversal)
+   - Recursively expands table selection to include FK-connected chains
+   - Uses Breadth-First Search (BFS) to traverse the graph up to `max_depth` levels
    - **Outgoing FKs** (priority): If selected table has FK → other table, add that table
    - **Incoming FKs** (secondary): If other table has FK → selected table, add that table
-   - Safety limit: Max 5 additional tables to prevent context explosion
-   - **Why?** Ensures complete join paths even if referenced tables weren't semantically matched
+   - **Multi-hop traversal**: Follows FK chains recursively (e.g., orders → customers → addresses → regions)
+   - **Deduplication**: Ensures each table appears only once (even if referenced by multiple selected tables)
+   - **Safety limits**: 
+     - `max_depth` (default: 3) - Maximum hop depth (1=direct only, 2=1-hop, 3=2-hop, etc.)
+     - `max_expansion` (default: 20) - Maximum additional tables to prevent context explosion
+   - **Why?** Ensures complete join paths even if intermediate tables weren't semantically matched
+   - **Example**: If `orders` is selected and has FK to `customers`, and `customers` has FK to `addresses`, all three tables are included (up to max_depth)
 
 3. **Stage 3: Column Retrieval** (No semantic search)
    - Gets **ALL columns** for selected tables (including expanded)
@@ -224,17 +261,37 @@ The `GraphContext` passed to the planner includes:
 
 **Example:**
 ```
-Query: "What are the test sets with max failures?"
+Query: "Show orders with customer addresses in regions"
 
-Stage 1: Semantic search → [test_sets, executions] (top 2)
-Stage 2: FK expansion → executions → test_cases (+1) → [test_sets, executions, test_cases]
-Stage 3: Get ALL columns → 13 columns from 3 tables
-Stage 4: Get ALL relationships → 2 FK relationships
+Stage 1: Semantic search → [orders] (top 1)
+Stage 2: Multi-hop FK expansion (max_depth=3):
+  - Level 1: orders → customers (FK: orders.customer_id → customers.id)
+  - Level 2: customers → addresses (FK: customers.address_id → addresses.id)
+  - Level 3: addresses → regions (FK: addresses.region_id → regions.id)
+  → [orders, customers, addresses, regions] (4 tables)
+Stage 3: Get ALL columns → All columns from 4 tables
+Stage 4: Get ALL relationships → All FK relationships between these tables
 
 Passed to LLM:
-- 3 tables (with descriptions)
-- 13 columns (with types, samples, nullable)
-- 2 relationships (complete join paths)
+- 4 tables (with descriptions)
+- All columns from 4 tables (with types, samples, nullable)
+- All relationships (complete join paths: orders→customers, customers→addresses, addresses→regions)
+```
+
+**Deduplication Example:**
+```
+Selected: [orders, invoices] (both semantically matched)
+Both have FK to: customers
+
+FK Expansion:
+  - Processing orders → Add customers (first encounter)
+  - Processing invoices → Skip customers (already in visited set)
+  → Final: [orders, invoices, customers] (customers appears once)
+
+Relationships passed to LLM:
+  - orders[customer_id] -> customers[id]
+  - invoices[customer_id] -> customers[id]
+  (Both relationships included, even though customers table appears once)
 ```
 
 ### Graph Context Formatting for LLM
@@ -313,7 +370,7 @@ UI visibility:
 | Hugging Face `401/404/410` | Token lacks access or wrong router; accept license, ensure `.env` base URL correct. |
 | Metadata hydration slow | Run prewarm; caches reduce cold-start time dramatically. |
 | Retrieval misses tables | Embedding provider not configured/tested; run sidebar "Test embedding connection". |
-| Missing FK-referenced tables | FK expansion should auto-include them; check logs for expansion details. If limit reached (5 tables), increase `max_expansion` in retriever. |
+| Missing FK-referenced tables | FK expansion should auto-include them via multi-hop traversal; check logs for expansion details. If limit reached, increase `SQLAI_FK_EXPANSION_MAX_DEPTH` (default: 3) or `SQLAI_FK_EXPANSION_MAX_TABLES` (default: 20) in `.env`. |
 | No columns found for selected tables | Check table name matching (case-insensitive); verify graph_cards.db has columns for those tables. |
 
 ### Production deployment checklist

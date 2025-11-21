@@ -926,54 +926,97 @@ def main() -> None:
     )
     ask_clicked = st.button("Run analysis", type="primary")
 
-    if ask_clicked:
+    if ask_clicked or st.session_state.get("force_new_query"):
         question = (st.session_state.get("current_question") or "").strip()
         st.session_state["saved_query_result"] = None
-        with st.spinner("Analysing..."):
-            if not question:
-                st.warning("Please enter a question before running the analysis.")
-            else:
+        force_new = st.session_state.pop("force_new_query", False)
+        
+        if not question:
+            st.warning("Please enter a question before running the analysis.")
+        else:
+            # Check for similar questions first (unless forcing new query)
+            spinner_text = "Generating new query..." if force_new else "Checking for similar questions..."
+            with st.spinner(spinner_text):
                 try:
-                    result = service.ask(question)
+                    result = service.ask(question, skip_similarity_check=force_new)
                 except ValueError as exc:
                     st.warning(str(exc))
                 except Exception as exc:  # noqa: BLE001
                     st.exception(exc)
                 else:
-                    if result.get("execution_error"):
-                        st.warning(result["execution_error"])
+                    # Check if similar question found and confirmation required
+                    if result.get("similar_question_found") and result.get("confirmation_required") and not force_new:
+                        st.session_state["similar_question_confirmation"] = {
+                            "question": question,
+                            "matched_question": result["matched_question"],
+                            "matched_sql": result["matched_sql"],
+                            "entry_id": result["entry_id"],
+                            "similarity_score": result["similarity_score"],
+                            "intent_confidence": result["intent_confidence"],
+                        }
+                        st.info(result["answer"]["text"])
+                        
+                        col1, col2 = st.columns(2)
+                        with col1:
+                            if st.button("✅ Yes, reuse previous query", type="primary", key="reuse_query"):
+                                # Execute the saved query
+                                try:
+                                    saved_result = service.execute_saved_query(result["entry_id"])
+                                    st.session_state["saved_query_result"] = saved_result
+                                    st.session_state["saved_query_message"] = f"Reused query from: '{result['matched_question']}'"
+                                    st.session_state["similar_question_confirmation"] = None
+                                    st.success("Query executed successfully!")
+                                    st.rerun()
+                                except Exception as exc:
+                                    st.error(f"Failed to execute saved query: {exc}")
+                        
+                        with col2:
+                            if st.button("🔄 No, generate new query", key="generate_new"):
+                                # Re-run with skip_similarity_check
+                                st.session_state["similar_question_confirmation"] = None
+                                st.session_state["force_new_query"] = True
+                                st.rerun()
                     else:
-                        if result.get("plan", {}).get("sql_generation_note"):
-                            st.warning(result["plan"]["sql_generation_note"])
-                        st.success("Analysis complete.")
-                    st.markdown(result["answer"])
-                    
-                    # Display the full prompt and final SQL
-                    if result.get("formatted_prompt") or result.get("final_sql"):
-                        with st.expander("📋 Full Prompt & Final SQL (After Intent Critic/Repair)", expanded=False):
-                            if result.get("final_sql"):
-                                st.subheader("Final SQL (After All Intent Repairs)")
-                                st.caption("This is the SQL that will be executed, after all intent critic/repair iterations.")
-                                st.code(result["final_sql"], language="sql")
-                                st.divider()
-                            
-                            if result.get("formatted_prompt"):
-                                st.subheader("Full Planner Prompt")
-                                st.caption("This is the complete prompt including all graph context (tables, columns, relationships) that was sent to the planner LLM to generate the SQL query. This prompt is logged at INFO level in the application logs.")
-                                st.code(result["formatted_prompt"], language="text")
-                    
-                    if result.get("plan"):
-                        with st.expander("LLM Plan", expanded=False):
-                            st.json(result["plan"])
-                    if result.get("followups"):
-                        st.markdown("**Suggested follow-ups:**")
-                        for item in result["followups"]:
-                            st.markdown(f"- {item}")
-                    if not result.get("execution_error"):
-                        render_executions(result)
-                    st.session_state["conversation_history"] = service.get_conversation()
-                    st.session_state["saved_queries"] = service.list_saved_queries()
-                    st.session_state["saved_query_message"] = None
+                        # Normal result display
+                        if result.get("execution_error"):
+                            st.warning(result["execution_error"])
+                        else:
+                            if result.get("plan", {}).get("sql_generation_note"):
+                                st.warning(result["plan"]["sql_generation_note"])
+                            st.success("Analysis complete.")
+                        
+                        # Handle answer display (could be dict or string)
+                        answer_text = result.get("answer", {})
+                        if isinstance(answer_text, dict):
+                            answer_text = answer_text.get("text", "")
+                        st.markdown(answer_text)
+                        
+                        # Display the full prompt and final SQL
+                        if result.get("formatted_prompt") or result.get("final_sql"):
+                            with st.expander("📋 Full Prompt & Final SQL (After Intent Critic/Repair)", expanded=False):
+                                if result.get("final_sql"):
+                                    st.subheader("Final SQL (After All Intent Repairs)")
+                                    st.caption("This is the SQL that will be executed, after all intent critic/repair iterations.")
+                                    st.code(result["final_sql"], language="sql")
+                                    st.divider()
+                                
+                                if result.get("formatted_prompt"):
+                                    st.subheader("Full Planner Prompt")
+                                    st.caption("This is the complete prompt including all graph context (tables, columns, relationships) that was sent to the planner LLM to generate the SQL query. This prompt is logged at INFO level in the application logs.")
+                                    st.code(result["formatted_prompt"], language="text")
+                        
+                        if result.get("plan"):
+                            with st.expander("LLM Plan", expanded=False):
+                                st.json(result["plan"])
+                        if result.get("followups"):
+                            st.markdown("**Suggested follow-ups:**")
+                            for item in result["followups"]:
+                                st.markdown(f"- {item}")
+                        if not result.get("execution_error"):
+                            render_executions(result)
+                        st.session_state["conversation_history"] = service.get_conversation()
+                        st.session_state["saved_queries"] = service.list_saved_queries()
+                        st.session_state["saved_query_message"] = None
 
     saved_result = st.session_state.get("saved_query_result")
     if saved_result:

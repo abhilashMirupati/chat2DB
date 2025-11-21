@@ -155,6 +155,8 @@ class SemanticRetriever:
         *,
         max_tables: int = 6,
         max_columns: Optional[int] = None,  # None = no limit, include ALL columns
+        fk_expansion_max_depth: int = 3,  # Maximum hop depth for FK expansion
+        fk_expansion_max_tables: int = 20,  # Maximum additional tables to add via FK expansion
     ) -> RetrievalResult:
         """
         Select relevant graph cards using semantic search on tables only.
@@ -229,14 +231,18 @@ class SemanticRetriever:
             schema_prefix = f"{card.schema}." if card.schema else ""
             LOGGER.info("  %d. %s%s (columns: %d)", idx, schema_prefix, card.name, len(card.columns))
         
-        # Step 4b: Expand selection to include FK-referenced tables (1-hop expansion)
-        # This ensures we have complete join paths even if referenced tables weren't semantically matched
-        LOGGER.info("Step 3b - Expanding table selection to include FK-referenced tables (1-hop)")
+        # Step 4b: Expand selection to include FK-referenced tables (multi-hop expansion)
+        # This ensures we have complete join paths even if intermediate tables weren't semantically matched
+        LOGGER.info(
+            "Step 3b - Expanding table selection to include FK-referenced tables (multi-hop, max_depth=%d, max_expansion=%d)",
+            fk_expansion_max_depth, fk_expansion_max_tables
+        )
         try:
             expanded_tables = self._expand_tables_with_fk_references(
                 selected_tables, 
                 graph,
-                max_expansion=5,  # Safety limit: max 5 additional tables
+                max_expansion=fk_expansion_max_tables,
+                max_depth=fk_expansion_max_depth,
             )
             if len(expanded_tables) > len(selected_tables):
                 new_tables = [t for t in expanded_tables if t not in selected_tables]
@@ -431,94 +437,243 @@ class SemanticRetriever:
         
         return table_hits
 
+    # COMMENTED OUT: Old 1-hop FK expansion method
+    # REASON: Replaced with multi-hop recursive expansion (_expand_tables_with_fk_references_multi_hop)
+    # to capture entire chains of connected tables (e.g., orders -> customers -> addresses -> regions).
+    # The old method only did 1-hop expansion, which could miss intermediate tables in longer join paths.
+    # The new method uses BFS traversal to follow FK relationships recursively up to max_depth levels.
+    #
+    # def _expand_tables_with_fk_references(
+    #     self,
+    #     selected_tables: List[TableCard],
+    #     graph: GraphContext,
+    #     max_expansion: int = 5,
+    # ) -> List[TableCard]:
+    #     """
+    #     Expand table selection to include all tables referenced by foreign keys (1-hop expansion).
+    #     This ensures we have complete join paths even if referenced tables weren't semantically matched.
+    #     
+    #     Handles both:
+    #     - Outgoing FKs: Selected table has FK -> other table (add other table) [PRIORITY]
+    #     - Incoming FKs: Other table has FK -> selected table (add other table) [SECONDARY]
+    #     
+    #     Safety features:
+    #     - Max expansion limit to prevent context explosion
+    #     - Only 1-hop expansion (no recursive expansion)
+    #     - Validates tables exist in graph before adding
+    #     
+    #     Example:
+    #     - Selected: [table1, table2]
+    #     - table2 has FK -> table3
+    #     - table4 has FK -> table1
+    #     - Returns: [table1, table2, table3, table4] (if within limit)
+    #     """
+    #     ... (old implementation removed)
+
     def _expand_tables_with_fk_references(
         self,
         selected_tables: List[TableCard],
         graph: GraphContext,
-        max_expansion: int = 5,
+        max_expansion: int = 20,
+        max_depth: int = 3,
     ) -> List[TableCard]:
         """
-        Expand table selection to include all tables referenced by foreign keys (1-hop expansion).
-        This ensures we have complete join paths even if referenced tables weren't semantically matched.
+        Recursively expand table selection to include all tables in FK-connected chains (multi-hop expansion).
+        This ensures we have complete join paths even if intermediate tables weren't semantically matched.
+        
+        Uses BFS (Breadth-First Search) to traverse the graph:
+        - Level 0: Initially selected tables
+        - Level 1: Tables directly connected via FK (outgoing + incoming)
+        - Level 2: Tables connected to Level 1 tables
+        - Level N: Up to max_depth levels
         
         Handles both:
         - Outgoing FKs: Selected table has FK -> other table (add other table) [PRIORITY]
         - Incoming FKs: Other table has FK -> selected table (add other table) [SECONDARY]
         
         Safety features:
+        - Max depth limit to prevent infinite loops
         - Max expansion limit to prevent context explosion
-        - Only 1-hop expansion (no recursive expansion)
+        - Deduplication using sets to ensure uniqueness
         - Validates tables exist in graph before adding
         
-        Example:
-        - Selected: [table1, table2]
-        - table2 has FK -> table3
-        - table4 has FK -> table1
-        - Returns: [table1, table2, table3, table4] (if within limit)
+        Example (max_depth=3):
+        - Selected: [orders]
+        - Level 1: [customers] (orders.customer_id -> customers.id)
+        - Level 2: [addresses] (customers.address_id -> addresses.id)
+        - Level 3: [regions] (addresses.region_id -> regions.id)
+        - Returns: [orders, customers, addresses, regions] (deduplicated)
+        
+        Args:
+            selected_tables: Initially selected tables from semantic/heuristic matching
+            graph: GraphContext containing all tables and relationships
+            max_expansion: Maximum number of additional tables to add (safety limit)
+            max_depth: Maximum hop depth (1=direct only, 2=1-hop, 3=2-hop, etc.)
+        
+        Returns:
+            List of TableCard objects including original selection + FK-connected tables (deduplicated)
         """
         if not selected_tables:
+            LOGGER.debug("  [FK Expansion] No tables to expand, returning empty list")
             return selected_tables
         
-        selected_table_names = {card.name for card in selected_tables}
+        LOGGER.debug(
+            "  [FK Expansion] Starting multi-hop expansion: %d initial tables, max_depth=%d, max_expansion=%d",
+            len(selected_tables), max_depth, max_expansion
+        )
+        LOGGER.debug("  [FK Expansion] Initial tables: %s", [t.name for t in selected_tables])
+        
         table_map = {card.name: card for card in graph.tables}
-        expanded = list(selected_tables)  # Start with selected tables
-        expanded_names = set(selected_table_names)
+        visited = {card.name for card in selected_tables}  # Track visited tables to prevent duplicates
+        result = list(selected_tables)  # Start with selected tables
         expansion_count = 0
         
-        # Find all relationships involving selected tables
-        try:
-            relationships = graph.relationships_for_tables(selected_tables)
-        except Exception as exc:  # noqa: BLE001
-            LOGGER.warning("Failed to get relationships for FK expansion: %s", exc)
-            return selected_tables  # Return original if relationships fail
+        # Build FK adjacency maps for efficient traversal
+        # Maps table_name -> set of connected table names
+        fk_outgoing: Dict[str, Set[str]] = {}  # table -> {referred_tables}
+        fk_incoming: Dict[str, Set[str]] = {}  # table -> {referencing_tables}
         
-        # Priority 1: Outgoing FKs (selected table -> other table)
-        # These are critical for join completeness
-        for rel in relationships:
+        LOGGER.debug("  [FK Expansion] Building FK adjacency maps from %d relationships", len(graph.relationships))
+        for rel in graph.relationships:
+            source = rel.table
+            target = rel.detail.referred_table
+            
+            # Outgoing: source -> target
+            if source not in fk_outgoing:
+                fk_outgoing[source] = set()
+            fk_outgoing[source].add(target)
+            
+            # Incoming: target <- source
+            if target not in fk_incoming:
+                fk_incoming[target] = set()
+            fk_incoming[target].add(source)
+        
+        LOGGER.debug(
+            "  [FK Expansion] Built adjacency maps: %d tables with outgoing FKs, %d tables with incoming FKs",
+            len(fk_outgoing), len(fk_incoming)
+        )
+        
+        # BFS traversal: process level by level
+        current_level = {card.name for card in selected_tables}
+        actual_depth = 0  # Track actual depth reached
+        
+        for depth in range(1, max_depth + 1):
+            actual_depth = depth
             if expansion_count >= max_expansion:
                 LOGGER.warning(
-                    "FK expansion limit reached (%d), stopping expansion. "
-                    "Some FK-referenced tables may be missing.",
-                    max_expansion
+                    "  [FK Expansion] Expansion limit reached (%d) at depth %d, stopping expansion. "
+                    "Some FK-connected tables may be missing.",
+                    max_expansion, depth
                 )
                 break
             
-            # Case 1: Selected table has FK -> referred_table (outgoing FK)
-            if rel.table in selected_table_names:
-                referred_table = rel.detail.referred_table
-                if referred_table and referred_table not in expanded_names:
-                    if referred_table in table_map:
-                        expanded.append(table_map[referred_table])
-                        expanded_names.add(referred_table)
-                        expansion_count += 1
-                        LOGGER.debug("  Adding FK-referenced table: %s (referenced by %s via FK)", 
-                                   referred_table, rel.table)
-                    else:
-                        LOGGER.debug("  FK-referenced table '%s' not found in graph", referred_table)
-        
-        # Priority 2: Incoming FKs (other table -> selected table)
-        # These are less critical but help with reverse joins
-        for rel in relationships:
-            if expansion_count >= max_expansion:
-                break
+            if not current_level:
+                LOGGER.debug("  [FK Expansion] No more tables to expand at depth %d, stopping", depth)
+                break  # No more tables to expand
             
-            # Case 2: referred_table has FK -> selected table (incoming FK)
-            if rel.detail.referred_table in selected_table_names:
-                source_table = rel.table
-                if source_table and source_table not in expanded_names:
-                    if source_table in table_map:
-                        expanded.append(table_map[source_table])
-                        expanded_names.add(source_table)
-                        expansion_count += 1
-                        LOGGER.debug("  Adding FK-referencing table: %s (references %s via FK)", 
-                                   source_table, rel.detail.referred_table)
-                    else:
-                        LOGGER.debug("  FK-referencing table '%s' not found in graph", source_table)
+            LOGGER.debug("  [FK Expansion] Processing depth %d: %d tables", depth, len(current_level))
+            next_level = set()
+            
+            # Process all tables at current depth
+            for table_name in current_level:
+                if expansion_count >= max_expansion:
+                    break
+                
+                # Priority 1: Outgoing FKs (table -> other tables)
+                if table_name in fk_outgoing:
+                    for referred_table in fk_outgoing[table_name]:
+                        if expansion_count >= max_expansion:
+                            break  # Stop if limit reached
+                        if referred_table not in visited:
+                            if referred_table in table_map:
+                                result.append(table_map[referred_table])
+                                visited.add(referred_table)
+                                next_level.add(referred_table)
+                                expansion_count += 1
+                                LOGGER.debug(
+                                    "  [FK Expansion] [Depth %d] Added FK-referenced table: %s (referenced by %s via FK)",
+                                    depth, referred_table, table_name
+                                )
+                                # Check limit after increment
+                                if expansion_count >= max_expansion:
+                                    break
+                            else:
+                                LOGGER.debug(
+                                    "  [FK Expansion] [Depth %d] FK-referenced table '%s' not found in graph",
+                                    depth, referred_table
+                                )
+                    # Break outer loop if limit reached
+                    if expansion_count >= max_expansion:
+                        break
+                
+                # Priority 2: Incoming FKs (other tables -> table)
+                if expansion_count >= max_expansion:
+                    break  # Stop if limit reached
+                if table_name in fk_incoming:
+                    for referencing_table in fk_incoming[table_name]:
+                        if expansion_count >= max_expansion:
+                            break  # Stop if limit reached
+                        if referencing_table not in visited:
+                            if referencing_table in table_map:
+                                result.append(table_map[referencing_table])
+                                visited.add(referencing_table)
+                                next_level.add(referencing_table)
+                                expansion_count += 1
+                                LOGGER.debug(
+                                    "  [FK Expansion] [Depth %d] Added FK-referencing table: %s (references %s via FK)",
+                                    depth, referencing_table, table_name
+                                )
+                                # Check limit after increment
+                                if expansion_count >= max_expansion:
+                                    break
+                            else:
+                                LOGGER.debug(
+                                    "  [FK Expansion] [Depth %d] FK-referencing table '%s' not found in graph",
+                                    depth, referencing_table
+                                )
+                    # Break outer loop if limit reached
+                    if expansion_count >= max_expansion:
+                        break
+            
+            current_level = next_level
+            if next_level:
+                LOGGER.debug(
+                    "  [FK Expansion] [Depth %d] Added %d tables, total expansion: %d/%d",
+                    depth, len(next_level), expansion_count, max_expansion
+                )
         
-        if expansion_count > 0:
-            LOGGER.info("  FK expansion: added %d table(s) (limit: %d)", expansion_count, max_expansion)
+        # Final deduplication (safety check - should already be unique, but ensure it)
+        seen = set()
+        deduplicated = []
+        for card in result:
+            if card.name not in seen:
+                deduplicated.append(card)
+                seen.add(card.name)
+            else:
+                LOGGER.debug("  [FK Expansion] Found duplicate table '%s' during deduplication, removing", card.name)
         
-        return expanded
+        if len(deduplicated) != len(result):
+            LOGGER.warning(
+                "  [FK Expansion] Deduplication removed %d duplicate tables",
+                len(result) - len(deduplicated)
+            )
+        
+        if len(deduplicated) > len(selected_tables):
+            added_count = len(deduplicated) - len(selected_tables)
+            LOGGER.info(
+                "  [FK Expansion] Multi-hop expansion complete: %d -> %d tables (+%d tables, max_depth=%d, actual_depth=%d)",
+                len(selected_tables), len(deduplicated), added_count, max_depth, actual_depth
+            )
+            LOGGER.debug(
+                "  [FK Expansion] Expanded tables: %s",
+                [t.name for t in deduplicated if t.name not in {s.name for s in selected_tables}]
+            )
+        else:
+            LOGGER.info(
+                "  [FK Expansion] No additional tables needed (all FK-connected tables already selected)"
+            )
+        
+        return deduplicated
 
     def _merge_tables(
         self,
