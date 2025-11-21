@@ -4,7 +4,6 @@ import logging
 from pathlib import Path
 from typing import Any, Dict, Iterable, List, Optional, Sequence
 import json
-import re
 
 try:
     import chromadb
@@ -17,6 +16,7 @@ except ImportError:  # pragma: no cover - handled dynamically when dependency mi
 
 from sqlai.config import EmbeddingConfig, VectorStoreConfig
 from sqlai.services.graph_cache import GraphCache, GraphCardRecord
+from sqlai.utils.vector_store_utils import build_vector_store_namespace
 
 LOGGER = logging.getLogger(__name__)
 
@@ -224,11 +224,8 @@ class VectorStoreManager:
         return normalised
 
     def _build_namespace(self) -> str:
-        provider = self.embedding_config.provider or "none"
-        model = self.embedding_config.model or "unspecified"
-        combined = f"{provider}__{model}"
-        slug = re.sub(r"[^a-zA-Z0-9._-]+", "_", combined)
-        return slug.lower()
+        """Build namespace using shared utility function for consistency."""
+        return build_vector_store_namespace(self.embedding_config)
 
     def _compute_store_path(self) -> Path:
         base = Path(self.config.path) if self.config.path else (self.cache_dir / "vector_store")
