@@ -16,6 +16,7 @@ except ImportError:
     sys.exit(1)
 
 from sqlai.config import EmbeddingConfig, VectorStoreConfig, load_embedding_config, load_vector_store_config
+from sqlai.utils.vector_store_utils import build_vector_store_namespace
 
 
 def verify_cards_vs_embeddings(graph_cards_db: Path, chroma_collection) -> None:
@@ -97,7 +98,8 @@ def inspect_embeddings():
     
     # Compute the store path (same logic as VectorStoreManager)
     cache_dir = Path(".cache")
-    namespace = f"{embedding_config.provider}__{embedding_config.model.replace('/', '_')}"
+    # Use shared utility function to ensure consistency with VectorStoreManager
+    namespace = build_vector_store_namespace(embedding_config)
     store_path = cache_dir / "vector_store" / namespace
     
     if not store_path.exists():
