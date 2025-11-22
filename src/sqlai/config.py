@@ -164,7 +164,11 @@ class AppConfig(BaseSettings):
 
     project_root: Path = Field(default_factory=lambda: Path(__file__).resolve().parents[2])
     cache_dir: Path = Field(default_factory=lambda: Path(".cache"))
-    telemetry_enabled: bool = Field(default=False)
+    telemetry_enabled: bool = Field(
+        default=False,
+        description="Enable telemetry/analytics (default: False to prevent PostHog SSL errors). "
+        "Set SQLAI_TELEMETRY_ENABLED=true in .env to enable.",
+    )
     streamlit_port: int = Field(default=8501)
     brand_name: Optional[str] = Field(default=None, description="Display name for UI branding.")
     brand_logo_path: Optional[Path] = Field(

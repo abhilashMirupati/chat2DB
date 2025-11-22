@@ -2,14 +2,23 @@
 
 from __future__ import annotations
 
+import os
+
+from dotenv import load_dotenv
+
+# Load config early to check telemetry setting
+load_dotenv()
+from sqlai.config import DatabaseConfig, LLMConfig, EmbeddingConfig, load_app_config
+from sqlai.utils.logging import _disable_telemetry
+
+# Disable telemetry if configured (prevents PostHog SSL errors)
+_disable_telemetry()
+
 from datetime import datetime
 from typing import Any, Dict, List, Optional, Tuple
 
 import pandas as pd
 import streamlit as st
-from dotenv import load_dotenv
-
-from sqlai.config import DatabaseConfig, LLMConfig, EmbeddingConfig, load_app_config
 from sqlai.database.connectors import create_db_engine, test_connection, list_schemas
 from sqlai.database.schema_introspector import _format_fk_detail
 from sqlai.services.analytics_service import AnalyticsService
@@ -25,7 +34,6 @@ DB_TYPE_TEMPLATES: Dict[str, str] = {
     "SQLite": "sqlite:///path/to/database.db",
 }
 
-load_dotenv()
 configure_logging()
 
 st.set_page_config(page_title="SQLAI: Natural Language Analytics", page_icon="💡", layout="wide")
@@ -58,7 +66,7 @@ def _resolve_brand_logo() -> Optional[str]:
 
 
 def _trigger_rerun() -> None:
-    rerun_fn = getattr(st, "rerun", None)
+    rerun_fn = getattr(st, "rerun", None)  
     if callable(rerun_fn):
         rerun_fn()
         return

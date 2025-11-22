@@ -37,15 +37,30 @@ Alternatively, add the same key/value pairs to the project `.env` file.
 
 from __future__ import annotations
 
+import os
+import warnings
+
+from dotenv import load_dotenv
+
+# Load config early to check telemetry setting
+load_dotenv()
+from sqlai.config import load_app_config, load_database_config, load_embedding_config, load_vector_store_config
+from sqlai.utils.logging import _disable_telemetry
+
+# Disable telemetry if configured (prevents PostHog SSL errors at root cause)
+_disable_telemetry()
+
+# Suppress SSL warnings as fallback (in case telemetry still attempts connection)
+warnings.filterwarnings("ignore", category=UserWarning, module="urllib3")
+warnings.filterwarnings("ignore", message=".*SSL.*", category=UserWarning)
+warnings.filterwarnings("ignore", message=".*certificate.*", category=UserWarning)
+warnings.filterwarnings("ignore", message=".*posthog.*", category=UserWarning, flags=warnings.IgnoreMessage)
+
 import argparse
 import logging
 import sys
 from pathlib import Path
 from typing import Dict, List, Set
-
-from dotenv import load_dotenv
-
-from sqlai.config import load_app_config, load_database_config, load_embedding_config, load_vector_store_config
 from sqlai.database.connectors import create_db_engine, test_connection
 from sqlai.database.schema_introspector import introspect_database, TableSummary
 from sqlai.services.cache_health import diff_vector_maps, graph_vector_id_map
@@ -63,10 +78,9 @@ logging.basicConfig(
 )
 # Suppress urllib3 and backoff SSL warnings (harmless telemetry connection failures)
 logging.getLogger("urllib3").setLevel(logging.ERROR)
+logging.getLogger("urllib3.connectionpool").setLevel(logging.ERROR)
 logging.getLogger("backoff").setLevel(logging.ERROR)
-# Suppress urllib3 connection pool warnings
-import warnings
-warnings.filterwarnings("ignore", category=UserWarning, module="urllib3")
+logging.getLogger("requests").setLevel(logging.ERROR)
 LOGGER = logging.getLogger(__name__)
 
 

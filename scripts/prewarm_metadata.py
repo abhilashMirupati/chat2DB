@@ -33,18 +33,36 @@ Alternatively, add the same key/value pairs to the project `.env` file.
 
 from __future__ import annotations
 
-import logging
+import os
 import warnings
 
+from dotenv import load_dotenv
+
+# Load config early to check telemetry setting
+load_dotenv()
+from sqlai.config import load_app_config
 from sqlai.services.analytics_service import AnalyticsService
+from sqlai.utils.logging import _disable_telemetry
+
+# Disable telemetry if configured (prevents PostHog SSL errors at root cause)
+_disable_telemetry()
+
+# Suppress SSL warnings as fallback (in case telemetry still attempts connection)
+warnings.filterwarnings("ignore", category=UserWarning, module="urllib3")
+warnings.filterwarnings("ignore", message=".*SSL.*", category=UserWarning)
+warnings.filterwarnings("ignore", message=".*certificate.*", category=UserWarning)
+warnings.filterwarnings("ignore", message=".*posthog.*", category=UserWarning, flags=warnings.IgnoreMessage)
+
+import logging
 
 
 def main() -> None:
     logging.basicConfig(level=logging.INFO)
     # Suppress urllib3 and backoff SSL warnings (harmless telemetry connection failures)
     logging.getLogger("urllib3").setLevel(logging.ERROR)
+    logging.getLogger("urllib3.connectionpool").setLevel(logging.ERROR)
     logging.getLogger("backoff").setLevel(logging.ERROR)
-    warnings.filterwarnings("ignore", category=UserWarning, module="urllib3")
+    logging.getLogger("requests").setLevel(logging.ERROR)
     service = AnalyticsService()
     cache_path = service.app_config.cache_dir / "table_metadata.db"
     logging.info("Metadata cache populated at %s", cache_path)

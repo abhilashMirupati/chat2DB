@@ -5,23 +5,13 @@ Inspect embeddings stored in ChromaDB vector store.
 This script shows what graph cards have been embedded and stored in the vector store.
 """
 
-import json
-import sys
+import os
 import warnings
-from pathlib import Path
 
-# Suppress urllib3 and backoff SSL warnings (harmless telemetry connection failures)
-warnings.filterwarnings("ignore", category=UserWarning, module="urllib3")
-import logging
-logging.getLogger("urllib3").setLevel(logging.ERROR)
-logging.getLogger("backoff").setLevel(logging.ERROR)
+from dotenv import load_dotenv
 
-try:
-    import chromadb
-except ImportError:
-    print("Error: chromadb is not installed. Install it with: pip install chromadb")
-    sys.exit(1)
-
+# Load config early to check telemetry setting
+load_dotenv()
 from sqlai.config import (
     EmbeddingConfig,
     VectorStoreConfig,
@@ -29,7 +19,34 @@ from sqlai.config import (
     load_embedding_config,
     load_vector_store_config,
 )
+from sqlai.utils.logging import _disable_telemetry
 from sqlai.utils.vector_store_utils import build_vector_store_namespace
+
+# Disable telemetry if configured (prevents PostHog SSL errors at root cause)
+_disable_telemetry()
+
+# Suppress SSL warnings as fallback (in case telemetry still attempts connection)
+warnings.filterwarnings("ignore", category=UserWarning, module="urllib3")
+warnings.filterwarnings("ignore", message=".*SSL.*", category=UserWarning)
+warnings.filterwarnings("ignore", message=".*certificate.*", category=UserWarning)
+warnings.filterwarnings("ignore", message=".*posthog.*", category=UserWarning, flags=warnings.IgnoreMessage)
+
+import json
+import logging
+import sys
+from pathlib import Path
+
+# Suppress urllib3 and backoff SSL warnings (harmless telemetry connection failures)
+logging.getLogger("urllib3").setLevel(logging.ERROR)
+logging.getLogger("urllib3.connectionpool").setLevel(logging.ERROR)
+logging.getLogger("backoff").setLevel(logging.ERROR)
+logging.getLogger("requests").setLevel(logging.ERROR)
+
+try:
+    import chromadb
+except ImportError:
+    print("Error: chromadb is not installed. Install it with: pip install chromadb")
+    sys.exit(1)
 
 
 def verify_cards_vs_embeddings(graph_cards_db: Path, chroma_collection) -> None:
