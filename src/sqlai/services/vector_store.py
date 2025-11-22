@@ -2,7 +2,7 @@ from __future__ import annotations
 
 import logging
 from pathlib import Path
-from typing import Any, Dict, Iterable, List, Optional, Sequence
+from typing import Any, Dict, Iterable, List, Optional, Sequence, Set
 import json
 
 try:
@@ -134,6 +134,51 @@ class VectorStoreManager:
                 }
             )
         return hits
+
+    def list_vectors_by_table(
+        self,
+        schema: Optional[str] = None,
+        *,
+        limit: int = 100_000,
+    ) -> Dict[str, Set[str]]:
+        """
+        Return a mapping of table_name -> set(vector_id) currently stored in ChromaDB.
+
+        Args:
+            schema: Optional schema filter. When provided, only vectors with matching
+                schema metadata are returned.
+            limit: Maximum number of vectors to retrieve from Chroma. Defaults to
+                100k which is sufficient for typical installations. Increase if needed.
+        """
+        if not self.enabled:
+            return {}
+        collection = self._ensure_collection()
+        get_kwargs: Dict[str, Any] = {
+            "include": ["metadatas"],
+            "limit": limit,
+        }
+        if schema:
+            get_kwargs["where"] = {"schema": schema}
+        try:
+            result = collection.get(**get_kwargs)
+        except Exception as exc:  # noqa: BLE001
+            LOGGER.warning(
+                "Vector store listing failed for schema '%s': %s",
+                schema or "*",
+                exc,
+            )
+            return {}
+
+        ids: List[str] = result.get("ids") or []
+        metadatas: List[Dict[str, Any]] = result.get("metadatas") or []
+        table_map: Dict[str, Set[str]] = {}
+
+        for idx, vector_id in enumerate(ids):
+            metadata = metadatas[idx] if idx < len(metadatas) else {}
+            table_name = metadata.get("table") or "__unknown__"
+            table_map.setdefault(table_name, set()).add(vector_id)
+
+        return table_map
 
     def _ensure_collection(self) -> Collection:
         if self._collection is not None:

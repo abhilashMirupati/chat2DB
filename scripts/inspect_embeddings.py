@@ -15,7 +15,13 @@ except ImportError:
     print("Error: chromadb is not installed. Install it with: pip install chromadb")
     sys.exit(1)
 
-from sqlai.config import EmbeddingConfig, VectorStoreConfig, load_embedding_config, load_vector_store_config
+from sqlai.config import (
+    EmbeddingConfig,
+    VectorStoreConfig,
+    load_app_config,
+    load_embedding_config,
+    load_vector_store_config,
+)
 from sqlai.utils.vector_store_utils import build_vector_store_namespace
 
 
@@ -93,11 +99,12 @@ def verify_cards_vs_embeddings(graph_cards_db: Path, chroma_collection) -> None:
 
 def inspect_embeddings():
     """Inspect and display all embeddings in the vector store."""
+    app_config = load_app_config()
     embedding_config = load_embedding_config()
     vector_config = load_vector_store_config()
     
     # Compute the store path (same logic as VectorStoreManager)
-    cache_dir = Path(".cache")
+    cache_dir = app_config.cache_dir
     # Use shared utility function to ensure consistency with VectorStoreManager
     namespace = build_vector_store_namespace(embedding_config)
     store_path = cache_dir / "vector_store" / namespace

@@ -37,6 +37,7 @@ Alternatively, add the same key/value pairs to the project `.env` file.
 
 from __future__ import annotations
 
+import argparse
 import logging
 import sys
 from pathlib import Path
@@ -47,9 +48,11 @@ from dotenv import load_dotenv
 from sqlai.config import load_app_config, load_database_config, load_embedding_config, load_vector_store_config
 from sqlai.database.connectors import create_db_engine, test_connection
 from sqlai.database.schema_introspector import introspect_database, TableSummary
+from sqlai.services.cache_health import diff_vector_maps, graph_vector_id_map
 from sqlai.services.graph_cache import GraphCache
 from sqlai.services.metadata_cache import MetadataCache
 from sqlai.services.vector_store import VectorStoreManager
+from sqlai.semantic.retriever import SemanticRetriever
 
 # Load environment variables from .env file (if present)
 load_dotenv()
@@ -63,6 +66,16 @@ LOGGER = logging.getLogger(__name__)
 
 def main() -> None:
     """Validate cache completeness."""
+    parser = argparse.ArgumentParser(
+        description="Validate metadata, graph cards, and embeddings cache completeness."
+    )
+    parser.add_argument(
+        "--fix",
+        action="store_true",
+        help="Automatically generate missing embeddings when detected (requires embedding provider configured).",
+    )
+    args = parser.parse_args()
+    
     app_config = load_app_config()
     db_config = load_database_config()
     embedding_config = load_embedding_config()
@@ -227,74 +240,115 @@ def main() -> None:
     LOGGER.info("    - Column cards: %s", card_counts_by_type.get("column", 0))
     LOGGER.info("    - Relationship/FK cards: %s", card_counts_by_type.get("relationship", 0))
     
-    vector_ids_in_store: Set[str] = set()
-    missing_embeddings: Set[str] = set()
-    card_vector_ids: Set[str] = set()
-    
     if not all_cards:
         LOGGER.warning("  ⚠ No graph cards found to check embeddings for")
+        expected_vector_map: Dict[str, Set[str]] = {}
     else:
-        # Get all vector IDs from cards
-        card_vector_ids = {card["vector_id"] for card in all_cards}
+        expected_vector_map = graph_vector_id_map(graph_cache, schema)
+        # Only check tables that exist in the live database
+        expected_vector_map = {
+            table: ids
+            for table, ids in expected_vector_map.items()
+            if table in db_table_names
+        }
+    
+    try:
+        actual_vector_map = vector_store.list_vectors_by_table(schema)
+    except Exception as exc:  # noqa: BLE001
+        LOGGER.error("  ✗ Failed to read vector store: %s", exc)
+        LOGGER.error("  Vector store may not be initialised. Run prewarm_metadata.py to generate embeddings.")
+        sys.exit(1)
+
+    total_vectors = sum(len(ids) for ids in actual_vector_map.values())
+    LOGGER.info("  Found %s embedding(s) in vector store", total_vectors)
+
+    missing_embeddings_map, orphaned_embeddings_map = diff_vector_maps(
+        expected_vector_map,
+        actual_vector_map,
+    )
+
+    if missing_embeddings_map:
+        LOGGER.warning(
+            "  ⚠ Missing embeddings for %s table(s) (total %s vector(s) absent):",
+            len(missing_embeddings_map),
+            sum(len(ids) for ids in missing_embeddings_map.values()),
+        )
+        for table in sorted(missing_embeddings_map.keys())[:10]:
+            missing_ids = missing_embeddings_map[table]
+            LOGGER.warning("    - %s: %s vector(s) missing", table, len(missing_ids))
+            sample_ids = list(sorted(missing_ids))[:5]
+            for vector_id in sample_ids:
+                LOGGER.warning("      • %s", vector_id)
+            if len(missing_ids) > 5:
+                LOGGER.warning("      ... and %s more", len(missing_ids) - 5)
+        if len(missing_embeddings_map) > 10:
+            LOGGER.warning("    ... and %s more tables", len(missing_embeddings_map) - 10)
         
-        # Check if vector store is ready
-        try:
-            collection = vector_store._ensure_collection()
-        except Exception as exc:
-            LOGGER.error("  ✗ Failed to access vector store: %s", exc)
-            LOGGER.error("  Vector store may not be initialized or embeddings may not be generated.")
-            LOGGER.error("  Please run prewarm_metadata.py to generate embeddings.")
-            sys.exit(1)
-        
-        # Get all vector IDs from the store
-        try:
-            # Query all embeddings (with a large limit)
-            all_vectors = collection.get(limit=100000)  # Large limit to get all
-            vector_ids_in_store = set(all_vectors.get("ids", []))
-            LOGGER.info("  Found %s embedding(s) in vector store", len(vector_ids_in_store))
-        except Exception as exc:
-            LOGGER.error("  ✗ Failed to query vector store: %s", exc)
-            sys.exit(1)
-        
-        # Check which cards are missing embeddings
-        missing_embeddings = card_vector_ids - vector_ids_in_store
-        
-        if missing_embeddings:
-            # Group by table
-            missing_by_table: Dict[str, List[str]] = {}
-            for card in all_cards:
-                if card["vector_id"] in missing_embeddings:
-                    table = card["table"]
-                    if table not in missing_by_table:
-                        missing_by_table[table] = []
-                    missing_by_table[table].append(
-                        f"{card['card_type']}:{card['identifier']}"
+        # Auto-fix if --fix flag is set
+        if args.fix:
+            LOGGER.info("")
+            LOGGER.info("=" * 80)
+            LOGGER.info("AUTO-FIX: Generating missing embeddings...")
+            LOGGER.info("=" * 80)
+            try:
+                semantic_retriever = SemanticRetriever(embedding_config, vector_store=vector_store)
+                embedder = semantic_retriever.provider
+                if not embedder:
+                    LOGGER.error(
+                        "  ✗ Cannot generate embeddings: embedding provider not configured or unavailable."
                     )
-            
-            LOGGER.warning("  ⚠ Missing embeddings for %s graph card(s) across %s table(s):", 
-                          len(missing_embeddings), len(missing_by_table))
-            for table in sorted(missing_by_table.keys())[:10]:
-                cards_list = missing_by_table[table]
-                LOGGER.warning("    - %s: %s card(s) missing", table, len(cards_list))
-                if len(cards_list) <= 5:
-                    for card_info in cards_list:
-                        LOGGER.warning("      • %s", card_info)
-            if len(missing_by_table) > 10:
-                LOGGER.warning("    ... and %s more tables", len(missing_by_table) - 10)
-        else:
+                    LOGGER.error(
+                        "  Please ensure SQLAI_EMBED_PROVIDER and SQLAI_EMBED_MODEL are set correctly."
+                    )
+                    sys.exit(1)
+                
+                tables_to_fix = sorted(missing_embeddings_map.keys())
+                LOGGER.info(
+                    "  Generating embeddings for %s table(s): %s",
+                    len(tables_to_fix),
+                    ", ".join(tables_to_fix[:10]) + (" ..." if len(tables_to_fix) > 10 else ""),
+                )
+                
+                vector_store.refresh_tables(
+                    schema,
+                    tables_to_fix,
+                    graph_cache,
+                    embedder,
+                )
+                
+                LOGGER.info("  ✓ Successfully generated embeddings for %s table(s)", len(tables_to_fix))
+                
+                # Re-check to verify fix
+                LOGGER.info("  Verifying embeddings were created...")
+                actual_vector_map_after = vector_store.list_vectors_by_table(schema)
+                missing_after, _ = diff_vector_maps(expected_vector_map, actual_vector_map_after)
+                if missing_after:
+                    LOGGER.warning(
+                        "  ⚠ Still missing embeddings for %s table(s) after fix attempt.",
+                        len(missing_after),
+                    )
+                else:
+                    LOGGER.info("  ✓ All missing embeddings have been generated successfully!")
+                    # Remove from missing_embeddings_map so summary shows success
+                    missing_embeddings_map = {}
+            except Exception as exc:  # noqa: BLE001
+                LOGGER.error("  ✗ Failed to generate embeddings: %s", exc)
+                LOGGER.error("  Please check your embedding provider configuration and try again.")
+                sys.exit(1)
+    else:
+        if expected_vector_map:
             LOGGER.info("  ✓ All graph cards have embeddings")
-        
-        # Check for orphaned embeddings (embeddings without corresponding graph cards)
-        orphaned_embeddings = vector_ids_in_store - card_vector_ids
-        if orphaned_embeddings:
-            LOGGER.warning("  ⚠ Found %s orphaned embedding(s) (no corresponding graph card)", 
-                          len(orphaned_embeddings))
-            # Sample a few orphaned IDs
-            sample_orphaned = list(orphaned_embeddings)[:5]
-            for vector_id in sample_orphaned:
-                LOGGER.warning("    - %s", vector_id)
-            if len(orphaned_embeddings) > 5:
-                LOGGER.warning("    ... and %s more", len(orphaned_embeddings) - 5)
+
+    if orphaned_embeddings_map:
+        LOGGER.warning(
+            "  ⚠ Found %s table(s) with orphaned embeddings (no corresponding graph cards):",
+            len(orphaned_embeddings_map),
+        )
+        for table in sorted(orphaned_embeddings_map.keys())[:5]:
+            orphaned_ids = orphaned_embeddings_map[table]
+            LOGGER.warning("    - %s: %s vector(s) orphaned", table, len(orphaned_ids))
+        if len(orphaned_embeddings_map) > 5:
+            LOGGER.warning("    ... and %s more tables", len(orphaned_embeddings_map) - 5)
     
     # Summary
     LOGGER.info("")
@@ -303,10 +357,10 @@ def main() -> None:
     LOGGER.info("=" * 80)
     
     has_issues = bool(
-        missing_in_cache or 
-        missing_graph_tables or 
-        tables_missing_card_types or 
-        (all_cards and missing_embeddings)
+        missing_in_cache
+        or missing_graph_tables
+        or tables_missing_card_types
+        or missing_embeddings_map
     )
     
     if not has_issues:
@@ -314,9 +368,12 @@ def main() -> None:
         LOGGER.info("  - Database: %s table(s)", len(db_table_names))
         LOGGER.info("  - Metadata cache: %s table(s)", len(metadata_table_names))
         LOGGER.info("  - Graph cards cache: %s table(s) with all card types", len(graph_table_names))
-        if all_cards:
-            LOGGER.info("  - Vector store: %s embedding(s) for %s card(s) (all types: table, column, relationship)", 
-                       len(vector_ids_in_store), len(all_cards))
+        if expected_vector_map:
+            LOGGER.info(
+                "  - Vector store: %s embedding(s) for %s card(s) (all types: table, column, relationship)",
+                total_vectors,
+                sum(len(ids) for ids in expected_vector_map.values()),
+            )
         sys.exit(0)
     else:
         LOGGER.warning("⚠ ISSUES FOUND:")
@@ -328,8 +385,11 @@ def main() -> None:
             LOGGER.warning("  - %s table(s) missing graph cards entirely", len(missing_graph_tables))
         if tables_missing_card_types:
             LOGGER.warning("  - %s table(s) missing required card types", len(tables_missing_card_types))
-        if all_cards and missing_embeddings:
-            LOGGER.warning("  - %s graph card(s) missing embeddings", len(missing_embeddings))
+        if missing_embeddings_map:
+            LOGGER.warning(
+                "  - %s table(s) missing embeddings",
+                len(missing_embeddings_map),
+            )
         LOGGER.warning("")
         LOGGER.warning("ACTION REQUIRED:")
         LOGGER.warning("  Please run prewarm_metadata.py to fix missing items:")

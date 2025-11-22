@@ -9,7 +9,7 @@ import json
 import threading
 from concurrent.futures import ThreadPoolExecutor, as_completed
 from dataclasses import replace
-from typing import Any, Dict, List, Optional, Sequence
+from typing import Any, Dict, List, Optional, Sequence, Set
 
 import pandas as pd
 
@@ -42,6 +42,11 @@ from sqlai.database.schema_introspector import (
 from sqlai.graph.context import GraphContext, TableCard, build_graph_context
 from sqlai.semantic.retriever import RetrievalResult, SemanticRetriever
 from sqlai.llm.providers import LLMProviderError, load_chat_model
+from sqlai.services.cache_health import (
+    diff_vector_maps,
+    graph_vector_id_map,
+    metadata_table_names,
+)
 from sqlai.services.metadata_cache import MetadataCache
 from sqlai.services.conversation_cache import ConversationCache
 from sqlai.services.graph_cache import GraphCache, GraphCardRecord
@@ -139,9 +144,14 @@ class AnalyticsService:
             schema=self.db_config.schema,
         )
         
+        schema_cache_key = self._schema_key() or "(default)"
         if prewarm_complete:
             # Skip graph card building - use cached cards
             LOGGER.info("Using cached graph cards. Skipping graph card building.")
+            self._ensure_vector_store_embeddings(
+                schema_cache_key,
+                context="prewarm cache detected",
+            )
         else:
             self._sync_graph_cache_and_vectors()
         self.row_cap = self.db_config.sample_row_limit
@@ -810,18 +820,11 @@ class AnalyticsService:
         LOGGER.info("=" * 80)
         LOGGER.info("")
 
-        if tables_to_refresh:
-            LOGGER.info(
-                "Refreshing vector store for %s table(s): %s",
-                len(tables_to_refresh),
-                ", ".join(tables_to_refresh[:10]),
-            )
-            self.vector_store.refresh_tables(
-                schema_key,
-                tables_to_refresh,
-                self.graph_cache,
-                self.semantic_retriever.provider,
-            )
+        self._ensure_vector_store_embeddings(
+            schema_key,
+            additional_tables=tables_to_refresh,
+            context="graph cache sync",
+        )
 
     def _build_graph_card_records(
         self,
@@ -1244,32 +1247,129 @@ class AnalyticsService:
         schema_key = self._schema_key()
         schema_cache_key = schema_key or "(default)"
         
-        # Check metadata cache
-        cached_metadata = self.metadata_cache.fetch_schema(schema_cache_key)
-        metadata_count = len([m for m in cached_metadata.values() if m.get("schema_hash") and m.get("description")])
-        
-        # Check graph cache
-        cached_tables = self.graph_cache.list_tables(schema_cache_key)
-        graph_count = len(cached_tables)
-        
-        # Consider prewarm complete if we have substantial cached data
-        # Require at least 10 tables or 50% of what we'd expect
-        is_complete = metadata_count >= 10 and graph_count >= 10
-        
-        if is_complete:
+        metadata_tables = metadata_table_names(self.metadata_cache, schema_cache_key)
+        graph_tables = set(self.graph_cache.list_tables(schema_cache_key))
+
+        if not metadata_tables:
             LOGGER.info(
-                "Prewarm cache check: Found %s cached metadata entries and %s cached graph tables.",
-                metadata_count,
-                graph_count,
+                "Prewarm cache check: metadata cache for schema '%s' is empty or incomplete.",
+                schema_cache_key,
             )
-        else:
+            return False
+
+        if not graph_tables:
             LOGGER.info(
-                "Prewarm cache check: Insufficient cache (metadata: %s, graph: %s). Will run full prewarm.",
-                metadata_count,
-                graph_count,
+                "Prewarm cache check: graph cache for schema '%s' is empty.",
+                schema_cache_key,
             )
-        
-        return is_complete
+            return False
+
+        missing_graph_tables = metadata_tables - graph_tables
+        orphaned_graph_tables = graph_tables - metadata_tables
+        if missing_graph_tables or orphaned_graph_tables:
+            LOGGER.warning(
+                "Prewarm cache mismatch for schema '%s'. Missing graph tables: %s. Orphaned graph tables: %s.",
+                schema_cache_key,
+                len(missing_graph_tables),
+                len(orphaned_graph_tables),
+            )
+            if missing_graph_tables:
+                LOGGER.warning(
+                    "  Missing graph tables (sample): %s",
+                    ", ".join(sorted(missing_graph_tables)[:10]),
+                )
+            if orphaned_graph_tables:
+                LOGGER.warning(
+                    "  Orphaned graph tables (sample): %s",
+                    ", ".join(sorted(orphaned_graph_tables)[:10]),
+                )
+            return False
+
+        expected_vectors = graph_vector_id_map(self.graph_cache, schema_cache_key)
+        actual_vectors = self.vector_store.list_vectors_by_table(schema_cache_key)
+        missing_vectors, orphaned_vectors = diff_vector_maps(expected_vectors, actual_vectors)
+        if missing_vectors:
+            LOGGER.warning(
+                "Prewarm cache check failed: vector store missing embeddings for %s table(s).",
+                len(missing_vectors),
+            )
+            LOGGER.warning(
+                "  Tables missing vectors (sample): %s",
+                ", ".join(sorted(missing_vectors.keys())[:10]),
+            )
+            return False
+
+        if orphaned_vectors:
+            LOGGER.warning(
+                "Vector store has %s orphaned table(s) without graph cards. Consider rerunning prewarm_metadata.py to clean them up.",
+                len(orphaned_vectors),
+            )
+
+        LOGGER.info(
+            "Prewarm cache check: metadata, graph cards, and vector store are aligned for %s table(s) in schema '%s'.",
+            len(metadata_tables),
+            schema_cache_key,
+        )
+        return True
+
+    def _ensure_vector_store_embeddings(
+        self,
+        schema_cache_key: str,
+        *,
+        additional_tables: Optional[Sequence[str]] = None,
+        context: str = "",
+    ) -> None:
+        expected_vectors = graph_vector_id_map(self.graph_cache, schema_cache_key)
+        actual_vectors = self.vector_store.list_vectors_by_table(schema_cache_key)
+        missing_by_table, orphaned_by_table = diff_vector_maps(expected_vectors, actual_vectors)
+        tables_to_refresh: Set[str] = set(additional_tables or [])
+        tables_to_refresh.update(missing_by_table.keys())
+
+        if not tables_to_refresh:
+            LOGGER.info(
+                "Vector store already in sync for schema '%s'%s.",
+                schema_cache_key,
+                f" ({context})" if context else "",
+            )
+            if orphaned_by_table:
+                LOGGER.warning(
+                    "Vector store has %s orphaned table(s) (no matching graph cards): %s%s",
+                    len(orphaned_by_table),
+                    ", ".join(sorted(orphaned_by_table.keys())[:5]),
+                    " ..." if len(orphaned_by_table) > 5 else "",
+                )
+            return
+
+        embedder = self.semantic_retriever.provider
+        if not embedder:
+            LOGGER.warning(
+                "Vector store requires refresh for %s table(s) but embedding provider is not configured.",
+                len(tables_to_refresh),
+            )
+            return
+
+        sample_tables = sorted(tables_to_refresh)[:10]
+        LOGGER.info(
+            "Vector store refresh required for %s table(s)%s. Tables: %s%s",
+            len(tables_to_refresh),
+            f" ({context})" if context else "",
+            ", ".join(sample_tables),
+            " ..." if len(tables_to_refresh) > 10 else "",
+        )
+        self.vector_store.refresh_tables(
+            schema_cache_key,
+            sorted(tables_to_refresh),
+            self.graph_cache,
+            embedder,
+        )
+
+        if orphaned_by_table:
+            LOGGER.warning(
+                "Vector store has %s orphaned table(s) (entries without graph cards): %s%s",
+                len(orphaned_by_table),
+                ", ".join(sorted(orphaned_by_table.keys())[:5]),
+                " ..." if len(orphaned_by_table) > 5 else "",
+            )
 
     def _hydrate_table_metadata_quick(self) -> None:
         """
