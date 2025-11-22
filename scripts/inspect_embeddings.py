@@ -7,7 +7,14 @@ This script shows what graph cards have been embedded and stored in the vector s
 
 import json
 import sys
+import warnings
 from pathlib import Path
+
+# Suppress urllib3 and backoff SSL warnings (harmless telemetry connection failures)
+warnings.filterwarnings("ignore", category=UserWarning, module="urllib3")
+import logging
+logging.getLogger("urllib3").setLevel(logging.ERROR)
+logging.getLogger("backoff").setLevel(logging.ERROR)
 
 try:
     import chromadb

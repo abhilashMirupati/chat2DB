@@ -34,12 +34,17 @@ Alternatively, add the same key/value pairs to the project `.env` file.
 from __future__ import annotations
 
 import logging
+import warnings
 
 from sqlai.services.analytics_service import AnalyticsService
 
 
 def main() -> None:
     logging.basicConfig(level=logging.INFO)
+    # Suppress urllib3 and backoff SSL warnings (harmless telemetry connection failures)
+    logging.getLogger("urllib3").setLevel(logging.ERROR)
+    logging.getLogger("backoff").setLevel(logging.ERROR)
+    warnings.filterwarnings("ignore", category=UserWarning, module="urllib3")
     service = AnalyticsService()
     cache_path = service.app_config.cache_dir / "table_metadata.db"
     logging.info("Metadata cache populated at %s", cache_path)

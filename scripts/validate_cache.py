@@ -61,6 +61,12 @@ logging.basicConfig(
     level=logging.INFO,
     format="%(asctime)s - %(name)s - %(levelname)s - %(message)s",
 )
+# Suppress urllib3 and backoff SSL warnings (harmless telemetry connection failures)
+logging.getLogger("urllib3").setLevel(logging.ERROR)
+logging.getLogger("backoff").setLevel(logging.ERROR)
+# Suppress urllib3 connection pool warnings
+import warnings
+warnings.filterwarnings("ignore", category=UserWarning, module="urllib3")
 LOGGER = logging.getLogger(__name__)
 
 
