@@ -197,17 +197,21 @@ CRITIC_PROMPT = ChatPromptTemplate.from_messages([
 REPAIR_PROMPT = ChatPromptTemplate.from_messages([
     (
         "system",
-        "You are a universal SQL repairer. Using dialect guide, Graph Context (tables/columns/FK paths), the original SQL, and the critic's hints/error message, produce a minimally changed corrected SQL that answers the question.\n"
-        "- You MAY make structural changes if required (e.g., add/remove JOINs that are present in Graph Context via FK paths; fix aliases; move filters to the correct table; adjust GROUP BY/aggregations).\n"
-        "- Prefer the shortest FK chain; avoid cartesian joins; respect row caps and dialect rules.\n"
-        "- Remove any chart/visualization 'probe' statements (e.g., SELECT 'pie' FROM dual) and keep only the data-producing SQL needed to answer the question.\n"
-        "- Use the critic's hints as exact instructions: add the named JOIN(s), move the named filter(s) to the correct alias.table.column, and ensure all referenced columns exist per Graph Context.\n"
-        "- Before returning, double-check each alias.table.column against the Graph Context's column lists and each JOIN against the FK paths; if any still mismatches, correct it.\n"
-        "- Keep the patch as small as possible while making the SQL correct.\n"
+        "You are a universal SQL repairer. Using the dialect guide, Graph Context (tables/columns/FK paths), the original SQL, and the critic's hints/error message, produce a corrected SQL statement that answers the question.\n"
+        "- Treat the critic's hints as mandatory instructions. Apply every hint explicitly (JOINs to add, filters to move, aliases to fix, aggregations to adjust). If a hint cannot be applied, explain why in \"why\" and try an alternative that still satisfies the critic's requirement.\n"
+        "- You MAY make structural edits (add/remove JOINs, rewrite CTEs, restructure GROUP BY) provided they stay within the Graph Context and shortest FK chains. Avoid cartesian joins, respect row caps, and obey the DIALECT_GUIDE.\n"
+        "- Remove any non-data \"probe\" statements (e.g., SELECT 'pie' FROM dual). Only return the SQL needed to answer the question.\n"
+        "- Before returning, SELF-CRITIQUE:\n"
+        "  1) For each alias.table.column referenced, confirm it exists in the Graph Context.\n"
+        "  2) Confirm every JOIN follows an FK path in the Graph Context.\n"
+        "  3) Confirm the SQL directly answers the question (filters, grouping, ordering, limits).\n"
+        "  4) Confirm the new SQL is actually different from the original whenever the critic demanded a change.\n"
+        "If any self-check fails, keep editing until it passes (or explain in \"why\" why the fix is impossible).\n"
+        "- Keep edits minimal but sufficient. Do not return the original SQL if the critic requested changes.\n"
         "Return strict JSON with:\n"
-        '  "patched_sql": string,\n'
-        '  "what_changed": [string...],\n'
-        '  "why": string\n'
+        '  \"patched_sql\": string,\n'
+        '  \"what_changed\": [string...],\n'
+        '  \"why\": string\n'
         "Return strict JSON: use double quotes only, no trailing commas, no comments.",
     ),
     (

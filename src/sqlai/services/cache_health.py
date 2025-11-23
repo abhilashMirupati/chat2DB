@@ -16,6 +16,7 @@ def metadata_table_names(metadata_cache: MetadataCache, schema: str) -> Set[str]
     """
     cached_metadata = metadata_cache.fetch_schema(schema)
     table_names: Set[str] = set()
+    total_entries = len(cached_metadata)
     for table_name, entry in cached_metadata.items():
         if not entry:
             continue
@@ -24,6 +25,18 @@ def metadata_table_names(metadata_cache: MetadataCache, schema: str) -> Set[str]
         if not (entry.get("description") or entry.get("samples")):
             continue
         table_names.add(table_name)
+    
+    # Log if filtering removed entries (for debugging)
+    if total_entries > len(table_names):
+        import logging
+        logger = logging.getLogger(__name__)
+        logger.debug(
+            "metadata_table_names: Schema '%s' has %s total entries, %s usable (filtered out %s entries without hash/description/samples)",
+            schema,
+            total_entries,
+            len(table_names),
+            total_entries - len(table_names),
+        )
     return table_names
 
 

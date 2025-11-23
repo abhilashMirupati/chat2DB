@@ -43,6 +43,45 @@ import sqlglot
 LOGGER = logging.getLogger(__name__)
 
 MAX_INTENT_REPAIRS = 3
+RE_REASONING_BLOCK = re.compile(r"<think>.*?</think>", re.IGNORECASE | re.DOTALL)
+RE_LEADING_FENCE = re.compile(r"^```(?:json)?", re.IGNORECASE)
+
+
+def _strip_reasoning_wrappers(text: str) -> str:
+    """
+    Remove common reasoning wrappers (e.g., DeepSeek's <think> blocks, ```json fences)
+    so downstream JSON parsing sees a clean object.
+    """
+    if not text:
+        return text
+    cleaned = text.strip()
+    if "<think>" in cleaned.lower():
+        cleaned = RE_REASONING_BLOCK.sub("", cleaned)
+    cleaned = RE_LEADING_FENCE.sub("", cleaned).strip()
+    if cleaned.endswith("```"):
+        cleaned = cleaned[:-3].strip()
+    return cleaned
+
+
+def _extract_first_json_object(text: str) -> Optional[str]:
+    """
+    Extract the first balanced {...} block from the text. Returns None if no block found.
+    """
+    if not text:
+        return None
+    start = None
+    depth = 0
+    for idx, ch in enumerate(text):
+        if ch == "{":
+            if depth == 0:
+                start = idx
+            depth += 1
+        elif ch == "}":
+            if depth > 0:
+                depth -= 1
+                if depth == 0 and start is not None:
+                    return text[start : idx + 1]
+    return None
 
 
 def _safe_invoke_json(chain: Any, payload: Dict[str, Any], llm: Any) -> Dict[str, Any]:
@@ -100,8 +139,9 @@ def _safe_invoke_json(chain: Any, payload: Dict[str, Any], llm: Any) -> Dict[str
         if hasattr(result, "content"):
             raw_content = getattr(result, "content", None) or raw_content
             # Try to parse it
+            sanitized = _strip_reasoning_wrappers(raw_content)
             try:
-                parsed = parser.parse(raw_content) if raw_content else {}
+                parsed = parser.parse(sanitized) if sanitized else {}
                 if isinstance(parsed, dict):
                     parsed["__raw"] = raw_content
                 return parsed
@@ -122,19 +162,20 @@ def _safe_invoke_json(chain: Any, payload: Dict[str, Any], llm: Any) -> Dict[str
             except Exception:
                 pass
         
-        if not raw_content:
+        sanitized = _strip_reasoning_wrappers(raw_content)
+        if not sanitized:
             LOGGER.warning("Could not extract raw LLM response for JSON repair. Exception: %s", exc)
             return {"verdict": "reject", "reasons": [], "repair_hints": [], "__raw": None}
         
         try:
             if fixer is not None:
-                parsed = fixer.parse(raw_content)
+                parsed = fixer.parse(sanitized)
                 # Attach raw text for downstream logging
                 if isinstance(parsed, dict):
                     parsed["__raw"] = raw_content
                 return parsed
             # Local best-effort repair if OutputFixingParser is unavailable
-            repaired = _best_effort_json_repair(raw_content)
+            repaired = _best_effort_json_repair(sanitized)
             repaired["__raw"] = raw_content
             return repaired
         except Exception as repair_exc:
@@ -150,11 +191,12 @@ def _best_effort_json_repair(text: str) -> Dict[str, Any]:
     - Remove trailing commas before } or ]
     - Attempt json.loads; fallback to an empty structure
     """
-    # Extract JSON object if extra prose present
-    start = text.find("{")
-    end = text.rfind("}")
-    if start != -1 and end != -1 and end > start:
-        text = text[start : end + 1]
+    cleaned = _strip_reasoning_wrappers(text)
+    candidate = _extract_first_json_object(cleaned)
+    if candidate:
+        text = candidate
+    else:
+        text = cleaned
     # Replace smart quotes
     text = text.replace("“", '"').replace("”", '"').replace("’", "'")
     # Naive single-quote to double-quote for keys only (simple heuristic)
@@ -603,9 +645,10 @@ def _plan_sql(llm: Any):
             raw_response = (prompt | llm).invoke(prompt_inputs)
             raw_planner_text = getattr(raw_response, "content", str(raw_response)) or ""
             LOGGER.debug("Planner raw LLM response (before parsing): %s", raw_planner_text[:500] if raw_planner_text else "<<empty>>")
-            if not raw_planner_text.strip():
+            sanitized_planner_text = _strip_reasoning_wrappers(raw_planner_text)
+            if not sanitized_planner_text.strip():
                 LOGGER.warning("Planner LLM returned empty response. This may indicate a model compatibility issue.")
-            plan = parser.parse(raw_planner_text)
+            plan = parser.parse(sanitized_planner_text)
         except Exception as parse_exc:
             LOGGER.debug("Planner JSON parsing failed: %s. Raw response: %s", parse_exc, raw_planner_text[:500] if raw_planner_text else "<<empty>>")
             # Fallback: attempt repair
@@ -614,12 +657,14 @@ def _plan_sql(llm: Any):
                     # Re-invoke if we don't have raw text yet
                     raw_response = (prompt | llm).invoke(prompt_inputs)
                     raw_planner_text = getattr(raw_response, "content", str(raw_response)) or ""
-                if raw_planner_text.strip():
+                    sanitized_planner_text = _strip_reasoning_wrappers(raw_planner_text)
+                sanitized_planner_text = _strip_reasoning_wrappers(raw_planner_text)
+                if sanitized_planner_text.strip():
                     if OutputFixingParser is not None:
                         fixing_parser = OutputFixingParser.from_llm(parser=parser, llm=llm)  # type: ignore[call-arg]
-                        plan = fixing_parser.parse(raw_planner_text)
+                        plan = fixing_parser.parse(sanitized_planner_text)
                     else:
-                        plan = _best_effort_json_repair(raw_planner_text)  # type: ignore[assignment]
+                        plan = _best_effort_json_repair(sanitized_planner_text)  # type: ignore[assignment]
                 else:
                     LOGGER.warning("Planner LLM returned empty response after retry. Model may not support this prompt format.")
                     plan = {"sql": "", "plan": {}, "rationale_summary": "", "tests": [], "summary": "", "followups": []}
@@ -668,13 +713,38 @@ def _plan_sql(llm: Any):
                             LOGGER.warning("Bootstrap returned empty patched_sql. Raw response: %s", bootstrap_raw[:1000])
                         else:
                             LOGGER.warning("Bootstrap returned empty patched_sql and no raw response captured.")
-                        plan["sql_generation_note"] = "Planner returned no SQL and bootstrap produced no patch."
-                        # Surface a clear error for routing to fail node
-                        state["execution_error"] = "Planner failed to produce SQL, and bootstrap also returned no patch."
+                        
+                        # Try domain fallback as last resort
+                        LOGGER.info("Trying domain-specific fallback SQL generation...")
+                        question = state.get("question", "")
+                        graph_context = state.get("graph_context")
+                        schema = state.get("schema_name")
+                        dialect = state.get("dialect", "")
+                        fallback_sql = maybe_generate_domain_sql(question, graph_context, schema, dialect)
+                        if fallback_sql:
+                            plan["sql"] = fallback_sql[0] if isinstance(fallback_sql, list) else fallback_sql
+                            plan.setdefault("notes", []).append("Used domain-specific fallback SQL due to planner and bootstrap failures.")
+                            LOGGER.info("Domain fallback generated SQL: %s", plan["sql"][:200])
+                        else:
+                            plan["sql_generation_note"] = "Planner returned no SQL and bootstrap produced no patch."
+                            # Surface a clear error for routing to fail node
+                            state["execution_error"] = "Planner failed to produce SQL, bootstrap returned no patch, and domain fallback found no match."
                 except Exception as e:
                     LOGGER.debug("Bootstrap baseline SQL failed: %s", e)
-                    plan["sql_generation_note"] = "Planner returned no SQL and bootstrap failed."
-                    state["execution_error"] = "Planner failed to produce SQL, and bootstrap failed."
+                    # Try domain fallback even if bootstrap threw an exception
+                    LOGGER.info("Bootstrap failed with exception. Trying domain-specific fallback SQL generation...")
+                    question = state.get("question", "")
+                    graph_context = state.get("graph_context")
+                    schema = state.get("schema_name")
+                    dialect = state.get("dialect", "")
+                    fallback_sql = maybe_generate_domain_sql(question, graph_context, schema, dialect)
+                    if fallback_sql:
+                        plan["sql"] = fallback_sql[0] if isinstance(fallback_sql, list) else fallback_sql
+                        plan.setdefault("notes", []).append("Used domain-specific fallback SQL due to planner and bootstrap failures.")
+                        LOGGER.info("Domain fallback generated SQL: %s", plan["sql"][:200])
+                    else:
+                        plan["sql_generation_note"] = "Planner returned no SQL and bootstrap failed."
+                        state["execution_error"] = "Planner failed to produce SQL, bootstrap failed, and domain fallback found no match."
             else:
                 plan = _post_process_plan(plan, state)
             LOGGER.debug("LLM plan: %s", plan)

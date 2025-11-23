@@ -54,7 +54,7 @@ _disable_telemetry()
 warnings.filterwarnings("ignore", category=UserWarning, module="urllib3")
 warnings.filterwarnings("ignore", message=".*SSL.*", category=UserWarning)
 warnings.filterwarnings("ignore", message=".*certificate.*", category=UserWarning)
-warnings.filterwarnings("ignore", message=".*posthog.*", category=UserWarning, flags=warnings.IgnoreMessage)
+warnings.filterwarnings("ignore", message=".*posthog.*", category=UserWarning)
 
 import argparse
 import logging
@@ -177,10 +177,17 @@ def main() -> None:
         if len(orphaned_in_cache) > 20:
             LOGGER.warning("    ... and %s more", len(orphaned_in_cache) - 20)
     
-    if not metadata_table_names and not db_table_names:
-        LOGGER.error("  ✗ No tables found in database or cache!")
-        LOGGER.error("  Please run prewarm_metadata.py first to populate the cache.")
+    # Only exit if database has no tables (nothing to validate)
+    # If cache is empty but DB has tables, continue to report missing cache
+    if not db_table_names:
+        LOGGER.error("  ✗ No tables found in database!")
+        LOGGER.error("  Cannot validate cache - database appears to be empty.")
         sys.exit(1)
+    
+    # If database has tables but cache is empty, this is a validation issue (not an error)
+    if not metadata_table_names:
+        LOGGER.warning("  ⚠ Metadata cache is empty, but database has %s table(s).", len(db_table_names))
+        LOGGER.warning("  Run prewarm_metadata.py to populate the cache.")
     
     # Step 2: Check which tables have graph cards and verify card types
     LOGGER.info("")
@@ -260,17 +267,19 @@ def main() -> None:
     LOGGER.info("    - Column cards: %s", card_counts_by_type.get("column", 0))
     LOGGER.info("    - Relationship/FK cards: %s", card_counts_by_type.get("relationship", 0))
     
+    # Always compare DB tables to cache, regardless of cache size
+    # Build expected vector map from graph cache, filtered to only DB tables
+    expected_vector_map = graph_vector_id_map(graph_cache, schema)
+    # Only check tables that exist in the live database (direct comparison)
+    expected_vector_map = {
+        table: ids
+        for table, ids in expected_vector_map.items()
+        if table in db_table_names
+    }
+    
     if not all_cards:
-        LOGGER.warning("  ⚠ No graph cards found to check embeddings for")
-        expected_vector_map: Dict[str, Set[str]] = {}
-    else:
-        expected_vector_map = graph_vector_id_map(graph_cache, schema)
-        # Only check tables that exist in the live database
-        expected_vector_map = {
-            table: ids
-            for table, ids in expected_vector_map.items()
-            if table in db_table_names
-        }
+        LOGGER.warning("  ⚠ No graph cards found in cache for database tables")
+        LOGGER.warning("  This means embeddings cannot be validated - run prewarm_metadata.py first")
     
     try:
         actual_vector_map = vector_store.list_vectors_by_table(schema)
@@ -347,17 +356,23 @@ def main() -> None:
                         "  ⚠ Still missing embeddings for %s table(s) after fix attempt.",
                         len(missing_after),
                     )
+                    # Update missing_embeddings_map to reflect remaining issues
+                    missing_embeddings_map = missing_after
                 else:
                     LOGGER.info("  ✓ All missing embeddings have been generated successfully!")
-                    # Remove from missing_embeddings_map so summary shows success
+                    # Clear missing_embeddings_map only if ALL embeddings were successfully created
                     missing_embeddings_map = {}
             except Exception as exc:  # noqa: BLE001
                 LOGGER.error("  ✗ Failed to generate embeddings: %s", exc)
                 LOGGER.error("  Please check your embedding provider configuration and try again.")
                 sys.exit(1)
     else:
+        # Only log success if we actually had cards to check
         if expected_vector_map:
             LOGGER.info("  ✓ All graph cards have embeddings")
+        elif db_table_names:
+            # DB has tables but no graph cards in cache
+            LOGGER.warning("  ⚠ No graph cards in cache to validate embeddings for")
 
     if orphaned_embeddings_map:
         LOGGER.warning(
@@ -388,12 +403,15 @@ def main() -> None:
         LOGGER.info("  - Database: %s table(s)", len(db_table_names))
         LOGGER.info("  - Metadata cache: %s table(s)", len(metadata_table_names))
         LOGGER.info("  - Graph cards cache: %s table(s) with all card types", len(graph_table_names))
+        # Always report vector store status based on actual comparison (DB tables vs cache)
         if expected_vector_map:
             LOGGER.info(
                 "  - Vector store: %s embedding(s) for %s card(s) (all types: table, column, relationship)",
                 total_vectors,
                 sum(len(ids) for ids in expected_vector_map.values()),
             )
+        else:
+            LOGGER.info("  - Vector store: No graph cards in cache to validate (compare DB tables to cache)")
         sys.exit(0)
     else:
         LOGGER.warning("⚠ ISSUES FOUND:")

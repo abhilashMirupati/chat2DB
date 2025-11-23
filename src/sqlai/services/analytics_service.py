@@ -34,6 +34,7 @@ from sqlai.config import (
 )
 from sqlai.database.connectors import build_sql_database, create_db_engine, test_connection
 from sqlai.database.schema_introspector import (
+    ColumnMetadata,
     ForeignKeyDetail,
     TableSummary,
     introspect_database,
@@ -71,6 +72,14 @@ class AnalyticsService:
         self.db_config = db_config or load_database_config()
         self.llm_config = llm_config or load_llm_config()
         self.embedding_config = embedding_config or load_embedding_config()
+        
+        # Log the actual LLM provider being used (for debugging)
+        LOGGER.info(
+            "AnalyticsService LLM config: provider='%s', model='%s', base_url='%s'",
+            self.llm_config.provider,
+            self.llm_config.model,
+            self.llm_config.base_url or "(default)",
+        )
         self.vector_config = load_vector_store_config()
         self.app_config = load_app_config()
         self.graph_cache = GraphCache(self.app_config.cache_dir / "graph_cards.db")
@@ -87,6 +96,7 @@ class AnalyticsService:
         self.metadata_cache = MetadataCache(self.app_config.cache_dir / "table_metadata.db")
         self.conversation_cache = ConversationCache(self.app_config.cache_dir / "conversation_history.db")
         self.table_hashes: Dict[str, str] = {}
+        self._schema_cache_key: Optional[str] = None  # Cache schema key to avoid recalculation
 
         self.engine = create_db_engine(self.db_config)
         connectivity_error = test_connection(self.engine)
@@ -96,9 +106,34 @@ class AnalyticsService:
         self.dialect = (self.engine.dialect.name or "").lower()
         self.dialect_hint = self._build_dialect_hint()
 
+        # Cache schema key once to avoid recalculation (do this BEFORE LLM load so we can check cache even if LLM fails)
+        schema_key = self._schema_key()
+        schema_cache_key = schema_key or "(default)"
+        self._schema_cache_key = schema_cache_key
+        LOGGER.info(
+            "Initializing AnalyticsService: db_config.schema='%s', calculated schema_key='%s', using schema_cache_key='%s'",
+            self.db_config.schema,
+            schema_key,
+            schema_cache_key,
+        )
+
         try:
             self.llm = load_chat_model(self.llm_config)
         except LLMProviderError as exc:
+            # Log cache status even if LLM fails, so user knows cache is available
+            LOGGER.warning("LLM provider failed to load: %s", exc)
+            LOGGER.info("Checking cache status before raising LLM error...")
+            try:
+                metadata_tables = metadata_table_names(self.metadata_cache, schema_cache_key)
+                graph_tables = set(self.graph_cache.list_tables(schema_cache_key))
+                LOGGER.info(
+                    "Cache status (even though LLM failed): schema='%s', metadata_tables=%s, graph_tables=%s",
+                    schema_cache_key,
+                    len(metadata_tables),
+                    len(graph_tables),
+                )
+            except Exception as cache_exc:  # noqa: BLE001
+                LOGGER.debug("Could not check cache status: %s", cache_exc)
             raise RuntimeError(f"Failed to load LLM provider: {exc}") from exc
 
         self._llm_lock = threading.Lock()
@@ -110,41 +145,87 @@ class AnalyticsService:
             else self.app_config.skip_prewarm_if_cached
         )
         
-        # Check if prewarm cache exists and is substantial
-        prewarm_complete = self._is_prewarm_complete() if skip_prewarm else False
-
-        if prewarm_complete:
+        # For UI: Assume cache is pre-loaded and validated (user ran prewarm_metadata.py + validate_cache.py)
+        # Skip all validation checks and DB introspection - load directly from cache
+        prewarm_complete = False  # Initialize
+        if skip_prewarm:
             LOGGER.info(
-                "Prewarm cache detected. Skipping expensive introspection/hydration steps. "
-                "Using cached metadata and graph cards."
+                "Checking cache for schema '%s' (skip_prewarm=True, using fast path if cache exists)...",
+                schema_cache_key,
             )
-            # Still need to introspect for schema structure, but we'll skip expensive operations
-            self.schema_summaries = introspect_database(
-                self.engine,
-                schema=self.db_config.schema,
-                include_system_tables=self.db_config.include_system_tables,
-            )
-            LOGGER.info("Loaded %s tables for schema introspection.", len(self.schema_summaries))
+            metadata_tables = metadata_table_names(self.metadata_cache, schema_cache_key)
+            graph_tables = set(self.graph_cache.list_tables(schema_cache_key))
             
-            # Quick hydration - just load from cache, skip LLM calls and sampling
-            self._hydrate_table_metadata_quick()
+            LOGGER.info(
+                "Cache check results for schema '%s': %s metadata tables, %s graph tables",
+                schema_cache_key,
+                len(metadata_tables),
+                len(graph_tables),
+            )
+            
+            # If cache has substantial data, trust it completely
+            # This is the fast path for 500+ tables - assumes cache is pre-validated
+            # NOTE: This loads schema from cache, not live database. If DB schema changed,
+            # user must re-run prewarm_metadata.py to refresh cache.
+            if len(metadata_tables) > 0 and len(graph_tables) > 0:
+                LOGGER.info(
+                    "Cache detected (%s metadata tables, %s graph tables). "
+                    "Assuming cache is pre-validated - loading schema from cache (not live DB). "
+                    "If database schema changed, re-run prewarm_metadata.py to refresh.",
+                    len(metadata_tables),
+                    len(graph_tables),
+                )
+                # Fast path: Reconstruct schema summaries from cache (no DB introspection)
+                # This means UI shows cached schema info, not current DB state
+                self.schema_summaries = self._load_schema_summaries_from_cache(schema_cache_key)
+                LOGGER.info("Loaded %s tables from cache (no DB introspection).", len(self.schema_summaries))
+                
+                # Quick hydration - just load from cache, skip LLM calls and sampling
+                self._hydrate_table_metadata_quick()
+                prewarm_complete = True  # Mark as complete for downstream logic
+            else:
+                # Cache exists but incomplete - do minimal validation
+                LOGGER.info(
+                    "Cache detected but incomplete. Performing minimal validation..."
+                )
+                prewarm_complete = self._is_prewarm_complete(schema_cache_key)
+                
+                if prewarm_complete:
+                    # Still need to introspect for schema structure
+                    self.schema_summaries = introspect_database(
+                        self.engine,
+                        schema=self.db_config.schema,
+                        include_system_tables=self.db_config.include_system_tables,
+                    )
+                    LOGGER.info("Loaded %s tables for schema introspection.", len(self.schema_summaries))
+                    self._hydrate_table_metadata_quick()
+                else:
+                    # Full prewarm flow
+                    self.schema_summaries = introspect_database(
+                        self.engine,
+                        schema=self.db_config.schema,
+                        include_system_tables=self.db_config.include_system_tables,
+                    )
+                    LOGGER.info("Loaded %s tables for schema introspection.", len(self.schema_summaries))
+                    self._hydrate_table_metadata()
         else:
-            # Full prewarm flow
+            # Full prewarm flow (skip_prewarm is False)
             self.schema_summaries = introspect_database(
                 self.engine,
                 schema=self.db_config.schema,
                 include_system_tables=self.db_config.include_system_tables,
             )
             LOGGER.info("Loaded %s tables for schema introspection.", len(self.schema_summaries))
-
             self._hydrate_table_metadata()
 
+        # Build graph context from schema summaries (works with both DB-introspected and cache-reconstructed summaries)
+        # This creates TableCard, ColumnCard, and RelationshipCard objects needed for multi-hop FK expansion
         self.graph_context = build_graph_context(
             summaries=self.schema_summaries,
             schema=self.db_config.schema,
         )
         
-        schema_cache_key = self._schema_key() or "(default)"
+        # Use cached schema key (already calculated above)
         if prewarm_complete:
             # Skip graph card building - use cached cards
             LOGGER.info("Using cached graph cards. Skipping graph card building.")
@@ -612,9 +693,12 @@ class AnalyticsService:
         )
 
         # Identify tables that need refresh (hash mismatch or missing)
+        # Also verify that all card types exist even when hash matches
         tables_to_refresh: List[str] = []
         summaries_to_process: List[TableSummary] = []
         cached_tables_count = 0
+        tables_missing_cards: List[str] = []
+        
         for summary in self.schema_summaries:
             table_name = summary.name
             schema_hash = self.table_hashes.get(table_name)
@@ -623,17 +707,39 @@ class AnalyticsService:
             cached_hash = cached_hashes.get(table_name)
             # Empty hash indicates migration/invalidation - treat as cache miss
             if cached_hash and cached_hash == schema_hash:
-                cached_tables_count += 1
-                continue  # Cache hit, skip
-            summaries_to_process.append(summary)
-            tables_to_refresh.append(table_name)
+                # Hash matches, but verify all card types exist
+                cards = self.graph_cache.get_cards_for_table(schema_key, table_name)
+                card_types = {card.card_type for card in cards}
+                expected_types = {"table"}
+                if summary.columns:
+                    expected_types.add("column")
+                if summary.foreign_keys:
+                    expected_types.add("relationship")
+                
+                # Check if all expected card types exist
+                missing_types = expected_types - card_types
+                if missing_types:
+                    LOGGER.warning(
+                        "Table '%s' has matching hash but missing card types: %s. Will rebuild.",
+                        table_name,
+                        ", ".join(sorted(missing_types)),
+                    )
+                    summaries_to_process.append(summary)
+                    tables_to_refresh.append(table_name)
+                else:
+                    cached_tables_count += 1
+                    # Hash matches and all card types exist - cache hit
+            else:
+                # Hash mismatch or missing - need to rebuild
+                summaries_to_process.append(summary)
+                tables_to_refresh.append(table_name)
 
         failed_graph_tables: List[str] = []
         timeout_graph_tables: List[str] = []
         
         if not summaries_to_process:
             LOGGER.info(
-                "All %s table(s) already have cached graph cards with matching schema hashes. Skipping graph card building.",
+                "All %s table(s) already have cached graph cards with matching schema hashes and all card types. Skipping graph card building.",
                 len(self.schema_summaries),
             )
             LOGGER.info("")
@@ -641,10 +747,11 @@ class AnalyticsService:
             LOGGER.info("GRAPH CARD BUILDING SUMMARY")
             LOGGER.info("=" * 80)
             LOGGER.info("Total tables: %s", len(self.schema_summaries))
-            LOGGER.info("✓ All tables have cached graph cards (no rebuild needed)")
+            LOGGER.info("✓ All tables have cached graph cards with all card types (no rebuild needed)")
             LOGGER.info("=" * 80)
             LOGGER.info("")
-            return
+            # Still need to check embeddings even if cards are cached
+            # (don't return early - continue to _ensure_vector_store_embeddings)
 
         LOGGER.info(
             "Building graph cards for %s table(s) that need refresh (%s already cached).",
@@ -820,9 +927,12 @@ class AnalyticsService:
         LOGGER.info("=" * 80)
         LOGGER.info("")
 
+        # Always check and ensure embeddings for ALL tables (even if cards were cached)
+        # This ensures missing embeddings are generated even when graph cards already exist
+        all_table_names = {summary.name for summary in self.schema_summaries}
         self._ensure_vector_store_embeddings(
             schema_key,
-            additional_tables=tables_to_refresh,
+            additional_tables=list(all_table_names),  # Check all tables, not just refreshed ones
             context="graph cache sync",
         )
 
@@ -885,6 +995,7 @@ class AnalyticsService:
             )
             metadata = {
                 "referred_table": rel_card.detail.referred_table,
+                "referred_schema": rel_card.detail.referred_schema,  # Store schema for reliable reconstruction
                 "constrained_columns": rel_card.detail.constrained_columns,
                 "referred_columns": rel_card.detail.referred_columns,
             }
@@ -1226,6 +1337,169 @@ class AnalyticsService:
         LOGGER.info("=" * 80)
         LOGGER.info("")
 
+    def get_cache_status(self) -> Dict[str, Any]:
+        """
+        Get cache status information for UI display.
+        Returns metadata and graph table counts for the current schema.
+        """
+        schema_cache_key = self._schema_cache_key or self._schema_key() or "(default)"
+        LOGGER.info("Getting cache status for schema: '%s'", schema_cache_key)
+        metadata_tables = metadata_table_names(self.metadata_cache, schema_cache_key)
+        graph_tables = set(self.graph_cache.list_tables(schema_cache_key))
+        has_cache = len(metadata_tables) > 0 or len(graph_tables) > 0
+        is_complete = len(metadata_tables) > 0 and len(graph_tables) > 0
+        LOGGER.info(
+            "Cache status for schema '%s': %s metadata tables, %s graph tables, has_cache=%s, is_complete=%s",
+            schema_cache_key,
+            len(metadata_tables),
+            len(graph_tables),
+            has_cache,
+            is_complete,
+        )
+        return {
+            "schema": schema_cache_key,
+            "metadata_tables": len(metadata_tables),
+            "graph_tables": len(graph_tables),
+            "has_cache": has_cache,
+            "is_complete": is_complete,
+        }
+
+    def _load_schema_summaries_from_cache(self, schema_cache_key: str) -> List[TableSummary]:
+        """
+        Reconstruct TableSummary objects directly from graph cache without DB introspection.
+        This is the fast path for 500+ tables when cache is pre-validated.
+        
+        Graph cache contains all necessary information:
+        - Table cards: row_estimate, comment
+        - Column cards: column name, type, nullable, comment, default, sample_values
+        - Relationship cards: FK details
+        """
+        # Get table names from cache (fast)
+        cached_tables = set(self.graph_cache.list_tables(schema_cache_key))
+        if not cached_tables:
+            LOGGER.warning("No tables found in cache - falling back to full introspection")
+            return introspect_database(
+                self.engine,
+                schema=self.db_config.schema,
+                include_system_tables=self.db_config.include_system_tables,
+            )
+        
+        LOGGER.info(
+            "Reconstructing schema summaries for %s cached table(s) from graph cache (no DB introspection)...",
+            len(cached_tables),
+        )
+        
+        summaries: List[TableSummary] = []
+        cached_metadata = self.metadata_cache.fetch_schema(schema_cache_key)
+        
+        for table_name in sorted(cached_tables):
+            # Get all cards for this table
+            cards = self.graph_cache.get_cards_for_table(schema_cache_key, table_name)
+            
+            # Extract table-level info from table card
+            table_card = next((c for c in cards if c.card_type == "table"), None)
+            row_estimate = None
+            comment = None
+            if table_card and table_card.metadata:
+                row_estimate = table_card.metadata.get("row_estimate")
+                comment = table_card.metadata.get("comment")
+            
+            # Reconstruct columns from column cards
+            column_cards = [c for c in cards if c.card_type == "column"]
+            columns: List[ColumnMetadata] = []
+            for col_card in column_cards:
+                col_meta = col_card.metadata
+                if not col_meta:
+                    continue
+                # Get sample values from metadata cache
+                table_meta = cached_metadata.get(table_name, {})
+                samples = table_meta.get("samples", {})
+                col_samples = samples.get(col_meta.get("column", ""), [])
+                
+                columns.append(
+                    ColumnMetadata(
+                        name=col_meta.get("column", ""),
+                        type=col_meta.get("type", "unknown"),
+                        nullable=col_meta.get("nullable", True),
+                        default=col_meta.get("default"),
+                        comment=col_meta.get("comment"),
+                        sample_values=col_samples if col_samples else None,
+                    )
+                )
+            
+            # Reconstruct foreign keys from relationship cards
+            rel_cards = [c for c in cards if c.card_type == "relationship"]
+            foreign_keys: List[ForeignKeyDetail] = []
+            for rel_card in rel_cards:
+                # Get FK info from metadata (stored when card was created)
+                rel_meta = rel_card.metadata
+                if rel_meta:
+                    # Metadata has: referred_table, referred_schema, constrained_columns, referred_columns
+                    # Use stored referred_schema, fallback to parsing from text if missing
+                    referred_schema = rel_meta.get("referred_schema")
+                    if referred_schema is None:
+                        # Fallback: Parse from text if not stored (for backward compatibility)
+                        rel_text = rel_card.text
+                        if " -> " in rel_text:
+                            right = rel_text.split(" -> ", 1)[1]
+                            if "[" in right:
+                                ref_table_part = right[:right.index("[")]
+                                if "." in ref_table_part:
+                                    referred_schema, _ = ref_table_part.rsplit(".", 1)
+                    
+                    foreign_keys.append(
+                        ForeignKeyDetail(
+                            constrained_columns=rel_meta.get("constrained_columns", []),
+                            referred_schema=referred_schema,
+                            referred_table=rel_meta.get("referred_table", ""),
+                            referred_columns=rel_meta.get("referred_columns", []),
+                        )
+                    )
+                else:
+                    # Fallback: Parse FK from text if metadata missing
+                    rel_text = rel_card.text
+                    try:
+                        if " -> " in rel_text:
+                            left, right = rel_text.split(" -> ", 1)
+                            if "[" in left and "]" in left and "[" in right and "]" in right:
+                                cols_part = left[left.index("[")+1:left.index("]")]
+                                ref_table_part = right[:right.index("[")]
+                                ref_cols_part = right[right.index("[")+1:right.index("]")]
+                                
+                                if "." in ref_table_part:
+                                    ref_schema_part, ref_table_name_part = ref_table_part.rsplit(".", 1)
+                                else:
+                                    ref_schema_part, ref_table_name_part = None, ref_table_part
+                                
+                                foreign_keys.append(
+                                    ForeignKeyDetail(
+                                        constrained_columns=[c.strip() for c in cols_part.split(",") if c.strip()],
+                                        referred_schema=ref_schema_part,
+                                        referred_table=ref_table_name_part,
+                                        referred_columns=[c.strip() for c in ref_cols_part.split(",") if c.strip()],
+                                    )
+                                )
+                    except Exception as exc:  # noqa: BLE001
+                        LOGGER.debug("Could not parse FK from relationship card: %s", exc)
+            
+            # Get description from metadata cache
+            table_meta = cached_metadata.get(table_name, {})
+            description = table_meta.get("description")
+            
+            summaries.append(
+                TableSummary(
+                    name=table_name,
+                    columns=columns,
+                    foreign_keys=foreign_keys,
+                    row_estimate=row_estimate,
+                    comment=comment,
+                    description=description,
+                )
+            )
+        
+        LOGGER.info("Successfully reconstructed %s table summaries from cache (no DB introspection)", len(summaries))
+        return summaries
+
     def _schema_key(self) -> str:
         if self.db_config.schema:
             return self.db_config.schema
@@ -1239,16 +1513,31 @@ class AnalyticsService:
                 return default_schema()
         return ""
 
-    def _is_prewarm_complete(self) -> bool:
+    def _is_prewarm_complete(self, schema_cache_key: Optional[str] = None) -> bool:
         """
         Check if prewarm cache exists and has substantial data.
         Returns True if cache has metadata for multiple tables, indicating prewarm was run.
+        
+        Args:
+            schema_cache_key: Optional pre-calculated schema cache key to avoid recalculation.
         """
-        schema_key = self._schema_key()
-        schema_cache_key = schema_key or "(default)"
+        if schema_cache_key is None:
+            schema_key = self._schema_key()
+            schema_cache_key = schema_key or "(default)"
+        
+        LOGGER.info(
+            "Checking prewarm cache completeness for schema '%s'...",
+            schema_cache_key,
+        )
         
         metadata_tables = metadata_table_names(self.metadata_cache, schema_cache_key)
         graph_tables = set(self.graph_cache.list_tables(schema_cache_key))
+        
+        LOGGER.info(
+            "Cache status: %s metadata table(s), %s graph table(s)",
+            len(metadata_tables),
+            len(graph_tables),
+        )
 
         if not metadata_tables:
             LOGGER.info(
@@ -1285,25 +1574,44 @@ class AnalyticsService:
                 )
             return False
 
-        expected_vectors = graph_vector_id_map(self.graph_cache, schema_cache_key)
-        actual_vectors = self.vector_store.list_vectors_by_table(schema_cache_key)
-        missing_vectors, orphaned_vectors = diff_vector_maps(expected_vectors, actual_vectors)
-        if missing_vectors:
-            LOGGER.warning(
-                "Prewarm cache check failed: vector store missing embeddings for %s table(s).",
-                len(missing_vectors),
+        try:
+            expected_vectors = graph_vector_id_map(self.graph_cache, schema_cache_key)
+            actual_vectors = self.vector_store.list_vectors_by_table(schema_cache_key)
+            missing_vectors, orphaned_vectors = diff_vector_maps(expected_vectors, actual_vectors)
+            
+            LOGGER.info(
+                "Vector store status: %s expected vector(s) across %s table(s), %s actual vector(s) across %s table(s)",
+                sum(len(ids) for ids in expected_vectors.values()),
+                len(expected_vectors),
+                sum(len(ids) for ids in actual_vectors.values()),
+                len(actual_vectors),
             )
-            LOGGER.warning(
-                "  Tables missing vectors (sample): %s",
-                ", ".join(sorted(missing_vectors.keys())[:10]),
-            )
-            return False
+            
+            if missing_vectors:
+                LOGGER.warning(
+                    "Prewarm cache check failed: vector store missing embeddings for %s table(s).",
+                    len(missing_vectors),
+                )
+                LOGGER.warning(
+                    "  Tables missing vectors (sample): %s",
+                    ", ".join(sorted(missing_vectors.keys())[:10]),
+                )
+                return False
 
-        if orphaned_vectors:
+            if orphaned_vectors:
+                LOGGER.warning(
+                    "Vector store has %s orphaned table(s) without graph cards. Consider rerunning prewarm_metadata.py to clean them up.",
+                    len(orphaned_vectors),
+                )
+        except Exception as exc:  # noqa: BLE001
+            # If vector store check fails (e.g., not initialized), don't fail prewarm check
+            # We'll handle missing vectors later during _ensure_vector_store_embeddings
             LOGGER.warning(
-                "Vector store has %s orphaned table(s) without graph cards. Consider rerunning prewarm_metadata.py to clean them up.",
-                len(orphaned_vectors),
+                "Could not verify vector store alignment (this is OK if embeddings are being generated): %s",
+                exc,
             )
+            # Still return True if metadata and graph caches are aligned
+            # Missing vectors will be generated on-demand
 
         LOGGER.info(
             "Prewarm cache check: metadata, graph cards, and vector store are aligned for %s table(s) in schema '%s'.",
@@ -1319,11 +1627,21 @@ class AnalyticsService:
         additional_tables: Optional[Sequence[str]] = None,
         context: str = "",
     ) -> None:
+        """
+        Ensure all graph cards have embeddings in the vector store.
+        
+        This checks ALL tables in the graph cache, not just the ones passed in additional_tables.
+        If additional_tables is provided, it forces a check for those tables even if they appear complete.
+        """
         expected_vectors = graph_vector_id_map(self.graph_cache, schema_cache_key)
         actual_vectors = self.vector_store.list_vectors_by_table(schema_cache_key)
         missing_by_table, orphaned_by_table = diff_vector_maps(expected_vectors, actual_vectors)
-        tables_to_refresh: Set[str] = set(additional_tables or [])
-        tables_to_refresh.update(missing_by_table.keys())
+        
+        # Always check all tables that have missing embeddings
+        tables_to_refresh: Set[str] = set(missing_by_table.keys())
+        # Also include any additional tables explicitly requested (forces refresh check)
+        if additional_tables:
+            tables_to_refresh.update(additional_tables)
 
         if not tables_to_refresh:
             LOGGER.info(

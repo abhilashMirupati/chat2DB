@@ -46,7 +46,7 @@ def configure_logging(level: int = logging.INFO) -> None:
     warnings.filterwarnings("ignore", category=UserWarning, module="urllib3")
     warnings.filterwarnings("ignore", message=".*SSL.*", category=UserWarning)
     warnings.filterwarnings("ignore", message=".*certificate.*", category=UserWarning)
-    warnings.filterwarnings("ignore", message=".*posthog.*", category=UserWarning, flags=warnings.IgnoreMessage)
+    warnings.filterwarnings("ignore", message=".*posthog.*", category=UserWarning)
 
 
 def get_logger(name: Optional[str] = None) -> logging.Logger:

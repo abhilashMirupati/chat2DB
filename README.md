@@ -27,7 +27,7 @@ SQLAI is designed for enterprise teams who need trustworthy, self-healing SQL ge
 
 ---
 ## Architecture
-
+F
 **Graph-RAG with Flat Storage:**
 - Graph representation in memory (TableCard nodes, RelationshipCard edges, ColumnCard properties)
 - Flat storage in SQLite (graph cards cached as records, not native graph database)

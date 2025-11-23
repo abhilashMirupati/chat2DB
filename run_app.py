@@ -1,4 +1,12 @@
-"""Entry point to launch the Streamlit UI."""
+"""Entry point to launch the Streamlit UI.
+
+Recommended workflow:
+1. Pre-load cache: python scripts/prewarm_metadata.py
+2. Validate cache: python scripts/validate_cache.py
+3. Launch UI: python run_app.py
+
+The UI will work without pre-loaded cache, but startup will be slower.
+"""
 
 import os
 from pathlib import Path
