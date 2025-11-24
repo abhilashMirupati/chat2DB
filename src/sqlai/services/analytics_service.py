@@ -9,7 +9,7 @@ import json
 import threading
 from concurrent.futures import ThreadPoolExecutor, as_completed
 from dataclasses import replace
-from typing import Any, Dict, List, Optional, Sequence, Set
+from typing import Any, Dict, List, Optional, Sequence, Set, Tuple
 
 import pandas as pd
 
@@ -21,6 +21,8 @@ from sqlai.agents.query_agent import (
     create_query_workflow,
     format_schema_markdown,
     _profile_dataframe,
+    ExecutionResult,
+    _format_execution_stats,
 )
 from sqlai.config import (
     DatabaseConfig,
@@ -174,7 +176,7 @@ class AnalyticsService:
                     "If database schema changed, re-run prewarm_metadata.py to refresh.",
                     len(metadata_tables),
                     len(graph_tables),
-                )
+            )
                 # Fast path: Reconstruct schema summaries from cache (no DB introspection)
                 # This means UI shows cached schema info, not current DB state
                 self.schema_summaries = self._load_schema_summaries_from_cache(schema_cache_key)
@@ -199,15 +201,6 @@ class AnalyticsService:
                     )
                     LOGGER.info("Loaded %s tables for schema introspection.", len(self.schema_summaries))
                     self._hydrate_table_metadata_quick()
-                else:
-                    # Full prewarm flow
-                    self.schema_summaries = introspect_database(
-                        self.engine,
-                        schema=self.db_config.schema,
-                        include_system_tables=self.db_config.include_system_tables,
-                    )
-                    LOGGER.info("Loaded %s tables for schema introspection.", len(self.schema_summaries))
-                    self._hydrate_table_metadata()
         else:
             # Full prewarm flow (skip_prewarm is False)
             self.schema_summaries = introspect_database(
@@ -237,7 +230,8 @@ class AnalyticsService:
             self._sync_graph_cache_and_vectors()
         self.row_cap = self.db_config.sample_row_limit
 
-        self.workflow = create_query_workflow(self.llm, self.engine)
+        # Get max repair iterations from app config (already loaded in __init__)
+        self.workflow = create_query_workflow(self.llm, self.engine, max_repair_iterations=self.app_config.max_repair_iterations)
         self.sql_database = build_sql_database(self.engine, self.db_config)
         self.conversation: List[Dict[str, Any]] = []
 
@@ -418,13 +412,19 @@ class AnalyticsService:
                 "reason": f"Error: {exc}",
             }
 
-    def ask(self, question: str, skip_similarity_check: bool = False) -> Dict[str, Any]:
+    def ask(
+        self, 
+        question: str, 
+        skip_similarity_check: bool = False,
+        desired_columns: Optional[str] = None,
+    ) -> Dict[str, Any]:
         """
         Execute the LangGraph workflow end-to-end.
         
         Args:
             question: User's natural language question
             skip_similarity_check: If True, skip checking for similar questions (for testing or forced regeneration)
+            desired_columns: Optional comma-separated list of column names the user wants in results
         
         Returns:
             Dict with answer, chart, SQL, and execution results
@@ -473,17 +473,24 @@ class AnalyticsService:
                         "entry_id": similar["entry_id"],
                         "confirmation_required": True,
                         "answer": {
-                            "text": (
-                                f"I found a similar question you asked before:\n\n"
-                                f"**Previous question:** {similar['matched_question']}\n\n"
-                                f"**Your current question:** {question}\n\n"
-                                f"These appear to have the same intent (confidence: {intent_check['confidence']:.0%}).\n\n"
-                                f"Would you like me to reuse the previous SQL query, or generate a new one?"
-                            ),
+                            "text": "A similar question was found in your query history. Please choose an option below.",
                         },
                     }
 
         LOGGER.info("Received question: %s", question)
+        
+        # Parse desired columns if provided (allow synonyms - LLM will map them)
+        validated_columns = None
+        raw_column_inputs = []
+        if desired_columns:
+            validated_columns, raw_column_inputs = self._parse_and_validate_columns(desired_columns)
+            if validated_columns:
+                LOGGER.info("User specified desired columns (validated): %s", ", ".join(validated_columns))
+            if raw_column_inputs:
+                LOGGER.info("User specified desired columns (raw input): %s", ", ".join(raw_column_inputs))
+                # Use raw input for LLM (allows synonyms/aliases), validated for hints
+                # If no validated columns, LLM will still receive raw input to map synonyms
+        
         retrieval = self.semantic_retriever.select_cards(
             graph=self.graph_context,
             question=question,
@@ -505,6 +512,9 @@ class AnalyticsService:
         prompt_inputs["value_anchors"] = value_anchor_text
         prompt_inputs["retrieval_details"] = json.dumps(retrieval.details, indent=2)
         prompt_inputs["analysis_hints"] = self._question_hints(question)
+        # Pass both validated (for hints) and raw (for LLM synonym mapping)
+        prompt_inputs["desired_columns"] = validated_columns or []  # Validated columns for hints
+        prompt_inputs["desired_columns_raw"] = raw_column_inputs  # Raw user input for LLM to map synonyms
         metadata_snapshot = self.graph_context.serialize_metadata()
         prompt_inputs["user_question"] = question
 
@@ -522,6 +532,8 @@ class AnalyticsService:
                 "row_cap": self.row_cap,
                 "graph_metadata": metadata_snapshot,
                 "graph_context": self.graph_context,
+                "desired_columns": validated_columns or [],  # Validated columns for hints
+                "desired_columns_raw": raw_column_inputs,  # Raw user input for LLM synonym mapping
             }
         )
         LOGGER.debug("Workflow result state: %s", result_state)
@@ -595,6 +607,208 @@ class AnalyticsService:
         }
         self._record_conversation(record["question"], result, cached=True)
         return result
+
+    def rerun_saved_query_with_fresh_summary(self, entry_id: int) -> Dict[str, Any]:
+        """
+        Rerun a saved query with fresh SQL execution and generate a new summary using LLM.
+        This skips similarity detection and directly executes the SQL, then summarizes.
+        
+        Args:
+            entry_id: The ID of the saved query to rerun
+            
+        Returns:
+            Dict with answer, executions, plan, chart, etc. (same structure as ask())
+        """
+        record = self.conversation_cache.get_interaction(entry_id)
+        if not record:
+            raise ValueError(f"No saved query found for id {entry_id}")
+        
+        sql = record["sql"]
+        question = record["question"]
+        plan = record.get("plan") or {}
+        
+        # Execute SQL
+        try:
+            dataframe = pd.read_sql_query(sql, self.engine)
+        except Exception as exc:
+            return {
+                "question": question,
+                "answer": {
+                    "text": f"Failed to execute SQL: {exc}",
+                    "chart": None,
+                    "followups": [],
+                },
+                "plan": plan,
+                "execution_error": str(exc),
+                "executions": [],
+            }
+        
+        # Create ExecutionResult
+        preview = dataframe.head(20).to_markdown(index=False) if not dataframe.empty else "No rows."
+        row_count = len(dataframe)
+        stats = _profile_dataframe(dataframe)
+        execution_result = ExecutionResult(
+            sql=sql,
+            dataframe=dataframe,
+            preview_markdown=preview,
+            row_count=row_count,
+            stats=stats,
+        )
+        
+        # Generate fresh summary using LLM
+        try:
+            # Use the same summarizer prompt as the workflow
+            from langchain_core.prompts import ChatPromptTemplate
+            
+            summarizer_prompt = ChatPromptTemplate.from_messages([
+                (
+                    "system",
+                    "You are a senior analytics engineer. Summarise SQL query results for business stakeholders. "
+                    "Answer precisely and, if charts are requested, ensure the chart specification is consistent "
+                    "with the data. You must always produce a summary, even if some fields appear missing or look "
+                    "like template placeholders (e.g. {question}). When information is absent, make a best-effort "
+                    "inference and explicitly note the gap rather than refusing.\n\n"
+                    "**CRITICAL: Self-critique your summary**\n"
+                    "- Verify that your summary directly answers the user's question.\n"
+                    "- Check that the key information requested in the question is present in your answer.\n"
+                    "- Ensure your answer matches the user's intent, not just the SQL results.\n"
+                    "- If the results don't fully answer the question, acknowledge what's missing.\n"
+                    "- Before finalizing, ask yourself: 'Does this answer what the user asked for?'",
+                ),
+                (
+                    "human",
+                    "Question: {question}\n\n"
+                    "Plan rationale: {rationale}\n\n"
+                    "SQL:\n{sql}\n\n"
+                    "Table preview:\n{preview}\n\n"
+                    "If a chart specification was provided, repeat it and explain it briefly.\n\n"
+                    "**Remember: Your summary must directly answer the user's question above.**",
+                ),
+            ])
+            
+            preview_sections = [f"Query 1:\n{execution_result.preview_markdown}"]
+            preview_markdown = "\n\n".join(preview_sections)
+            stats_text = _format_execution_stats([execution_result], self.row_cap)
+            combined_preview = f"{preview_markdown}\n\n[DATA SUMMARY]\n{stats_text}"
+            
+            summarizer_payload = {
+                "question": question,
+                "rationale": plan.get("rationale_summary") or plan.get("rationale", ""),
+                "sql": sql,
+                "preview": combined_preview,
+            }
+            
+            response = (summarizer_prompt | self.llm).invoke(summarizer_payload)
+            summary_text = response.content if hasattr(response, "content") else str(response)
+            
+            # Check for fallback needed
+            fallback_needed = (
+                "I cannot fulfill this request because you have not provided the actual values" in summary_text
+                or "{question}" in summary_text
+            )
+            
+            if fallback_needed:
+                fallback_preview = "No rows returned." if row_count == 0 else f"{row_count} row(s) returned."
+                summary_text = (
+                    f"Generated 1 result set. {fallback_preview} "
+                    "Showing raw data below; chart generation skipped because the summariser reported missing context.\n\n"
+                    f"[Auto Summary]\n{stats_text}"
+                )
+                chart = None
+            else:
+                chart = plan.get("chart")
+            
+        except Exception as exc:
+            LOGGER.warning("Failed to generate fresh summary, using fallback: %s", exc)
+            stats_text = _format_execution_stats([execution_result], self.row_cap)
+            summary_text = (
+                f"Reran query and retrieved {row_count} row(s).\n\n"
+                f"[Data Summary]\n{stats_text}"
+            )
+            chart = plan.get("chart")
+        
+        # Build result structure matching ask() response
+        result = {
+            "question": question,
+            "answer": {
+                "text": summary_text,
+                "chart": chart,
+                "followups": plan.get("followups", []),
+            },
+            "plan": plan,
+            "execution_error": None,
+            "executions": [
+                {
+                    "sql": sql,
+                    "data": dataframe.to_dict(orient="records"),
+                    "columns": list(dataframe.columns),
+                    "preview": preview,
+                    "row_count": row_count,
+                    "stats": stats,
+                }
+            ],
+        }
+        
+        # Record in conversation history
+        self._record_conversation(question, result, cached=False)
+        return result
+
+    def _parse_and_validate_columns(self, column_input: str) -> Tuple[Optional[List[str]], List[str]]:
+        """
+        Parse comma-separated column names. Returns both validated columns and raw user input.
+        
+        Returns:
+            Tuple of (validated_columns, raw_columns):
+            - validated_columns: List of column names that match Graph Context (for hints)
+            - raw_columns: List of user's original input (for LLM to handle synonyms/aliases)
+        
+        The LLM will handle mapping synonyms/aliases to actual column names, so we pass
+        through the raw input even if validation fails.
+        """
+        if not column_input or not column_input.strip():
+            return None, []
+        
+        # Parse comma-separated columns (preserve user's original input)
+        raw_columns = [col.strip() for col in column_input.split(",") if col.strip()]
+        if not raw_columns:
+            return None, []
+        
+        # Build set of all available column names (case-insensitive)
+        available_columns: Set[str] = set()
+        for table_card in self.graph_context.tables:
+            for col in table_card.columns:
+                available_columns.add(col.name.lower())
+        
+        # Validate and collect matching columns (for hints to LLM)
+        validated: List[str] = []
+        for col_input in raw_columns:
+            col_lower = col_input.lower()
+            # Try exact match first
+            if col_lower in available_columns:
+                # Find original case from graph context
+                for table_card in self.graph_context.tables:
+                    for col in table_card.columns:
+                        if col.name.lower() == col_lower:
+                            validated.append(col.name)  # Use original case
+                            break
+                    if validated and validated[-1].lower() == col_lower:
+                        break
+            else:
+                # Try fuzzy match (partial/substring)
+                matches = [col for col in available_columns if col_lower in col or col in col_lower]
+                if matches:
+                    # Use first match
+                    for table_card in self.graph_context.tables:
+                        for col in table_card.columns:
+                            if col.name.lower() == matches[0]:
+                                validated.append(col.name)
+                                break
+                        if validated and validated[-1].lower() == matches[0]:
+                            break
+        
+        # Return both validated (for hints) and raw (for LLM synonym handling)
+        # If no validated columns, still return raw so LLM can try to map synonyms
+        return (validated if validated else None, raw_columns)
 
     def _question_hints(self, question: str) -> str:
         if not question:
@@ -931,10 +1145,10 @@ class AnalyticsService:
         # This ensures missing embeddings are generated even when graph cards already exist
         all_table_names = {summary.name for summary in self.schema_summaries}
         self._ensure_vector_store_embeddings(
-            schema_key,
+                schema_key,
             additional_tables=list(all_table_names),  # Check all tables, not just refreshed ones
             context="graph cache sync",
-        )
+            )
 
     def _build_graph_card_records(
         self,

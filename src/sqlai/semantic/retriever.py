@@ -602,10 +602,10 @@ class SemanticRetriever:
                                     "  [FK Expansion] [Depth %d] FK-referenced table '%s' not found in graph",
                                     depth, referred_table
                                 )
-                    # Break outer loop if limit reached
-                    if expansion_count >= max_expansion:
-                        break
-                
+                        # Break outer loop if limit reached
+                        if expansion_count >= max_expansion:
+                            break
+        
                 # Priority 2: Incoming FKs (other tables -> table)
                 if expansion_count >= max_expansion:
                     break  # Stop if limit reached
@@ -632,8 +632,8 @@ class SemanticRetriever:
                                     depth, referencing_table
                                 )
                     # Break outer loop if limit reached
-                    if expansion_count >= max_expansion:
-                        break
+            if expansion_count >= max_expansion:
+                break
             
             current_level = next_level
             if next_level:

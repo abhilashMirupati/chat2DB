@@ -2,6 +2,7 @@
 
 from __future__ import annotations
 
+import json
 import os
 
 from dotenv import load_dotenv
@@ -40,6 +41,30 @@ st.set_page_config(page_title="SQLAI: Natural Language Analytics", page_icon="�
 
 LOGGER = get_logger(__name__)
 APP_CONFIG = load_app_config()
+LAST_SESSION_CONFIG_PATH = APP_CONFIG.cache_dir / "ui_last_session.json"
+PERSISTED_SESSION_KEYS = [
+    "active_profile_value",
+    "profile_name",
+    "db_type",
+    "db_url",
+    "db_schema",
+    "oracle_thick_mode",
+    "oracle_lib_dir",
+    "oracle_config_dir",
+    "sample_limit",
+    "include_system_tables",
+    "schema_select_option",
+    "llm_provider",
+    "llm_model",
+    "llm_base_url",
+    "llm_api_key",
+    "temperature",
+    "max_tokens",
+    "embedding_provider",
+    "embedding_model",
+    "embedding_base_url",
+    "embedding_api_key",
+]
 
 st.markdown(
     """
@@ -66,7 +91,7 @@ def _resolve_brand_logo() -> Optional[str]:
 
 
 def _trigger_rerun() -> None:
-    rerun_fn = getattr(st, "rerun", None)  
+    rerun_fn = getattr(st, "rerun", None)
     if callable(rerun_fn):
         rerun_fn()
         return
@@ -75,6 +100,41 @@ def _trigger_rerun() -> None:
         exp_rerun_fn()
         return
     raise RuntimeError("Current Streamlit version does not support rerun APIs.")
+
+
+def _load_last_session_config_if_needed() -> None:
+    if st.session_state.get("_last_session_loaded"):
+        return
+    st.session_state["_last_session_loaded"] = True
+    if not LAST_SESSION_CONFIG_PATH.exists():
+        return
+    try:
+        with open(LAST_SESSION_CONFIG_PATH, "r", encoding="utf-8") as handle:
+            payload = json.load(handle)
+    except Exception as exc:  # noqa: BLE001
+        LOGGER.debug("Failed to load last session config: %s", exc)
+        return
+    for key in PERSISTED_SESSION_KEYS:
+        if key in payload and payload[key] is not None:
+            st.session_state[key] = payload[key]
+
+
+def _persist_last_session_config() -> None:
+    try:
+        LAST_SESSION_CONFIG_PATH.parent.mkdir(parents=True, exist_ok=True)
+        payload = {key: st.session_state.get(key) for key in PERSISTED_SESSION_KEYS}
+        with open(LAST_SESSION_CONFIG_PATH, "w", encoding="utf-8") as handle:
+            json.dump(payload, handle, indent=2)
+    except Exception as exc:  # noqa: BLE001
+        LOGGER.debug("Failed to persist last session config: %s", exc)
+
+
+def _clear_persisted_session_config() -> None:
+    try:
+        if LAST_SESSION_CONFIG_PATH.exists():
+            LAST_SESSION_CONFIG_PATH.unlink()
+    except Exception as exc:  # noqa: BLE001
+        LOGGER.debug("Failed to remove persisted session config: %s", exc)
 
 def init_session_state() -> None:
     defaults: Dict[str, Any] = {
@@ -109,9 +169,11 @@ def init_session_state() -> None:
         "current_question": "",
         "saved_queries": [],
         "saved_query_result": None,
+        "_last_session_loaded": False,
     }
     for key, value in defaults.items():
         st.session_state.setdefault(key, value)
+    _load_last_session_config_if_needed()
 
 
 def init_service() -> AnalyticsService | None:
@@ -620,8 +682,48 @@ def sidebar_configuration() -> None:
         db_error = _validate_db_inputs(db_url)
         llm_error = _validate_llm_inputs(provider, model, base_url, api_key)
         embedding_error = _validate_embedding_inputs(embedding_provider, embedding_model, embedding_api_key)
+        
+        # Check if schema is selected (required for most databases, especially Oracle)
+        schema_validation_error = None
+        if not db_error:  # Only check schema if DB URL is valid
+            schema_choice = st.session_state.get("schema_select_option", "(current schema)")
+            manual_schema = st.session_state.get("db_schema", "")
+            
+            # Determine the actual schema value
+            if schema_choice == "(current schema)":
+                actual_schema = None  # Will use default schema
+            elif schema_choice == "(manual entry)":
+                actual_schema = manual_schema.strip() if manual_schema else None
+            else:
+                actual_schema = schema_choice
+            
+            # For Oracle databases, schema is typically required
+            # Check if DB URL suggests Oracle (oracle:// or contains :1521)
+            is_oracle = "oracle" in db_url.lower() or ":1521" in db_url or "oracle" in (st.session_state.get("db_type", "") or "").lower()
+            
+            if not actual_schema:
+                if is_oracle:
+                    # Oracle: Make it an error (blocking)
+                    schema_validation_error = (
+                        "⚠️ **Schema selection required for Oracle database.**\n\n"
+                        "Please select a schema from the dropdown or enter one manually in the 'Database' section. "
+                        "Initializing without a schema can take a very long time as it tries to introspect all schemas."
+                    )
+                else:
+                    # Other databases: Show warning but allow (some DBs don't require schema)
+                    # We'll show this as a warning in the status, not blocking
+                    st.session_state["connection_status"] = (
+                        "warning",
+                        "⚠️ No schema selected. Initialization may take longer. "
+                        "Consider selecting a schema from the dropdown for faster startup."
+                    )
+                    _render_status(st.session_state.get("connection_status"), db_status_placeholder)
+        
         if db_error:
             st.session_state["connection_status"] = ("error", db_error)
+            _render_status(st.session_state.get("connection_status"), db_status_placeholder)
+        elif schema_validation_error:
+            st.session_state["connection_status"] = ("error", schema_validation_error)
             _render_status(st.session_state.get("connection_status"), db_status_placeholder)
         elif llm_error:
             st.session_state["llm_status"] = ("error", llm_error)
@@ -793,7 +895,7 @@ def sidebar_configuration() -> None:
                 except Exception as exc:  # noqa: BLE001
                     # If cache check fails, log the error and show success
                     LOGGER.error("Could not check cache status: %s", exc, exc_info=True)
-                    st.session_state["connection_status"] = ("success", "Agent initialised successfully.")
+                st.session_state["connection_status"] = ("success", "Agent initialised successfully.")
                 
                 _render_status(st.session_state.get("connection_status"), db_status_placeholder)
                 st.session_state["service_initialised"] = True
@@ -818,6 +920,7 @@ def sidebar_configuration() -> None:
         st.session_state["schema_select_option"] = "(current schema)"
         st.session_state["embedding_status"] = None
         st.session_state["conversation_history"] = []
+        _clear_persisted_session_config()
 
     if test_llm_clicked:
         llm_error = _validate_llm_inputs(provider, model, base_url, api_key)
@@ -841,6 +944,8 @@ def sidebar_configuration() -> None:
             )
         st.session_state["embedding_status"] = status
         _render_status(status, embedding_status_placeholder)
+
+    _persist_last_session_config()
 
 
 def _test_llm_connection(provider: str, model: str, base_url: str | None, api_key: str | None) -> Tuple[str, str]:
@@ -1095,9 +1200,11 @@ def render_saved_queries(service: AnalyticsService) -> None:
             st.caption(f"Last saved: {run_at}")
             cols = st.columns([1, 1, 3])
             if cols[0].button("Run", key=f"run_saved_{entry['id']}"):
-                st.session_state["saved_query_result"] = service.execute_saved_query(entry["id"])
+                # Rerun with fresh summary - skip similarity detection
+                st.session_state["saved_query_result"] = service.rerun_saved_query_with_fresh_summary(entry["id"])
                 st.session_state["current_question"] = entry["question"]
-                st.session_state["saved_query_message"] = f"Replayed cached SQL saved on {run_at}."
+                st.session_state["saved_query_message"] = f"Reran query with fresh results (saved on {run_at})."
+                st.session_state["skip_similarity_check"] = True  # Skip similarity check on next run
                 _trigger_rerun()
             if cols[1].button("Load", key=f"load_saved_{entry['id']}"):
                 st.session_state["current_question"] = entry["question"]
@@ -1108,7 +1215,11 @@ def render_saved_queries(service: AnalyticsService) -> None:
 
 
 def render_executions(result: Dict[str, Any]) -> None:
-    for idx, execution in enumerate(result["executions"]):
+    executions = result.get("executions", [])
+    if not executions:
+        st.info("No execution results to display.")
+        return
+    for idx, execution in enumerate(executions):
         st.subheader(f"Query {idx + 1}")
         st.code(execution["sql"], language="sql")
         dataframe = pd.DataFrame(execution["data"])
@@ -1168,7 +1279,10 @@ def main() -> None:
     db_url = st.session_state.get("db_url", "")
     schema = st.session_state.get("db_schema", "")
     
-    if db_url:
+    # Check if user has actually configured database (not just empty)
+    has_configured_db = bool(db_url and db_url.strip())
+    
+    if has_configured_db:
         try:
             db_config = DatabaseConfig(
                 url=db_url,
@@ -1185,39 +1299,89 @@ def main() -> None:
     # Check LLM config
     llm_provider = st.session_state.get("llm_provider", "")
     llm_model = st.session_state.get("llm_model", "")
+    llm_base_url = st.session_state.get("llm_base_url", "")
+    llm_api_key = st.session_state.get("llm_api_key", "")
+    
+    # Check if these are just default values (user hasn't configured anything)
+    is_default_llm = (
+        llm_provider == "ollama" and
+        llm_model == "llama3" and
+        not llm_base_url and
+        not llm_api_key
+    )
+    
     if not llm_provider or not llm_model:
-        missing_requirements.append("**LLM**: Provider and model are required. Configure in the sidebar under 'LLM' section.")
+        # Empty values - don't show error (user hasn't started configuring)
+        pass
+    elif is_default_llm:
+        # Default values - don't show error (user hasn't configured anything)
+        pass
     else:
-        try:
-            llm_config = LLMConfig(
-                provider=llm_provider,
-                model=llm_model,
-                base_url=st.session_state.get("llm_base_url") or None,
-                api_key=st.session_state.get("llm_api_key") or None,
-                temperature=st.session_state.get("temperature", 0.1),
-                max_output_tokens=st.session_state.get("max_tokens", 2048),
-            )
-        except Exception:  # noqa: BLE001
-            missing_requirements.append("**LLM**: Configuration is invalid. Check the sidebar under 'LLM' section.")
+        # User has configured something - validate it
+        llm_validation_error = _validate_llm_inputs(
+            llm_provider,
+            llm_model,
+            llm_base_url or None,
+            llm_api_key or None,
+        )
+        if llm_validation_error:
+            missing_requirements.append(f"**LLM**: {llm_validation_error}")
+        else:
+            try:
+                llm_config = LLMConfig(
+                    provider=llm_provider,
+                    model=llm_model,
+                    base_url=llm_base_url or None,
+                    api_key=llm_api_key or None,
+                    temperature=st.session_state.get("temperature", 0.1),
+                    max_output_tokens=st.session_state.get("max_tokens", 2048),
+                )
+            except Exception as exc:  # noqa: BLE001
+                missing_requirements.append(f"**LLM**: Configuration error: {str(exc)}. Check the sidebar under 'LLM' section.")
     
     # Check Embedding config
     embedding_provider = st.session_state.get("embedding_provider", "")
     embedding_model = st.session_state.get("embedding_model", "")
-    if not embedding_provider or not embedding_model:
-        missing_requirements.append("**Embedding**: Provider and model are required. Configure in the sidebar under 'Embeddings' section.")
-    else:
-        try:
-            embedding_config = EmbeddingConfig(
-                provider=embedding_provider,
-                model=embedding_model,
-                base_url=st.session_state.get("embedding_base_url") or None,
-                api_key=st.session_state.get("embedding_api_key") or None,
-            )
-        except Exception:  # noqa: BLE001
-            missing_requirements.append("**Embedding**: Configuration is invalid. Check the sidebar under 'Embeddings' section.")
+    embedding_api_key = st.session_state.get("embedding_api_key", "")
     
-    # Show configuration errors prominently
-    if missing_requirements:
+    # Check if these are just default values (user hasn't configured anything)
+    is_default_embedding = (
+        embedding_provider == "huggingface" and
+        embedding_model == "google/embeddinggemma-300m" and
+        not embedding_api_key
+    )
+    
+    if not embedding_provider or not embedding_model:
+        # Empty values - don't show error (user hasn't started configuring)
+        pass
+    elif is_default_embedding:
+        # Default values - don't show error (user hasn't configured anything)
+        pass
+    else:
+        # User has configured something - validate it
+        embedding_validation_error = _validate_embedding_inputs(
+            embedding_provider, 
+            embedding_model, 
+            embedding_api_key
+        )
+        if embedding_validation_error:
+            missing_requirements.append(f"**Embedding**: {embedding_validation_error}")
+        else:
+            try:
+                embedding_config = EmbeddingConfig(
+                    provider=embedding_provider,
+                    model=embedding_model,
+                    base_url=st.session_state.get("embedding_base_url") or None,
+                    api_key=embedding_api_key or None,
+                )
+            except Exception as exc:  # noqa: BLE001
+                missing_requirements.append(f"**Embedding**: Configuration error: {str(exc)}. Check the sidebar under 'Embeddings' section.")
+    
+    # Only show configuration errors if user has actually started configuring something
+    # OR if they've tried to initialize the agent
+    service_initialized_attempted = st.session_state.get("service_initialised", False)
+    
+    if missing_requirements and (has_configured_db or not is_default_llm or not is_default_embedding or service_initialized_attempted):
         st.error("**⚠️ Configuration Required**\n\n" + "\n\n".join(f"• {req}" for req in missing_requirements))
         st.info("💡 **Setup Steps:**\n1. Configure **Database** connection in sidebar\n2. Configure **LLM** provider and model in sidebar\n3. Configure **Embedding** provider and model in sidebar\n4. Click **'Initialise Agent'** button\n5. Then you can ask questions!")
     
@@ -1261,31 +1425,32 @@ def main() -> None:
                 else:
                     # Render schema directly from cache
                     _render_schema_from_cache(graph_cache, metadata_cache, schema_to_check)
-                st.divider()
         except Exception as cache_exc:  # noqa: BLE001
             LOGGER.debug("Could not render schema from cache: %s", cache_exc)
             if service and service.has_schema():
                 render_schema(service)
     
+    st.divider()
+    
     # Only show saved queries and conversation if service is fully initialized
     if service and service_ready:
         render_saved_queries(service)
         st.divider()
-        
+
         history = service.get_conversation()
         if history:
             with st.expander("Recent conversation", expanded=False):
                 for item in history:
                     st.markdown(f"**You:** {item['question']}")
-                    answer_text = item.get("answer") or "<no answer>"
-                    if isinstance(answer_text, str):
-                        st.markdown(f"**SQLAI:** {answer_text}")
-                    else:
-                        st.json(answer_text)
-                    if item.get("execution_error"):
-                        st.warning(f"Execution error: {item['execution_error']}")
-                    st.markdown("---")
-    
+                answer_text = item.get("answer") or "<no answer>"
+                if isinstance(answer_text, str):
+                    st.markdown(f"**SQLAI:** {answer_text}")
+                else:
+                    st.json(answer_text)
+                if item.get("execution_error"):
+                    st.warning(f"Execution error: {item['execution_error']}")
+                st.markdown("---")
+
     question_placeholder = "Which test sets had the highest failure rate last week?"
     st.text_area(
         "Ask a question",
@@ -1293,6 +1458,23 @@ def main() -> None:
         key="current_question",
         disabled=not service_ready,  # Disable if requirements not met
     )
+    
+    # Optional desired columns input - directly below question input
+    st.caption(
+        "💡 **Optional:** Specify desired columns (comma-separated) for more exact output. "
+        "You can use synonyms or natural names - the LLM will map them to actual column names. "
+        "Example: 'test set name, test case name, status' or 'name, id, created date'"
+    )
+    desired_columns_input = st.text_input(
+        "Desired columns (optional)",
+        value=st.session_state.get("desired_columns", ""),
+        placeholder="e.g., test set name, test case name, status, severity",
+        key="desired_columns_input",
+        disabled=not service_ready,
+        help="Leave blank to let the agent decide which columns to include. You can use natural language or synonyms - the LLM will map them correctly."
+    )
+    st.session_state["desired_columns"] = desired_columns_input.strip()
+    
     ask_clicked = st.button("Run analysis", type="primary", disabled=not service_ready)  # Disable button if requirements not met
 
     # Execute saved query automatically if user already confirmed reuse
@@ -1322,17 +1504,23 @@ def main() -> None:
             return
         
         question = (st.session_state.get("current_question") or "").strip()
+        desired_columns = st.session_state.get("desired_columns", "").strip()
         st.session_state["saved_query_result"] = None
         force_new = st.session_state.pop("force_new_query", False)
         
         if not question:
             st.warning("Please enter a question before running the analysis.")
         else:
-            # Check for similar questions first (unless forcing new query)
-            spinner_text = "Generating new query..." if force_new else "Checking for similar questions..."
+            # Check for similar questions first (unless forcing new query or explicitly skipping)
+            skip_similarity = force_new or st.session_state.pop("skip_similarity_check", False)
+            spinner_text = "Generating new query..." if skip_similarity else "Checking for similar questions..."
             with st.spinner(spinner_text):
                 try:
-                    result = service.ask(question, skip_similarity_check=force_new)
+                    result = service.ask(
+                        question, 
+                        skip_similarity_check=skip_similarity,
+                        desired_columns=desired_columns if desired_columns else None,
+                    )
                 except ValueError as exc:
                     st.warning(str(exc))
                 except Exception as exc:  # noqa: BLE001
@@ -1340,7 +1528,7 @@ def main() -> None:
                 else:
                     # Check if similar question found and confirmation required
                     if result.get("similar_question_found") and result.get("confirmation_required") and not force_new:
-                        # Store confirmation info for rendering outside the spinner
+                        # Store confirmation info for rendering outside the spinner (don't show duplicate messages here)
                         st.session_state["similar_question_confirmation"] = {
                             "question": question,
                             "matched_question": result["matched_question"],
@@ -1349,52 +1537,51 @@ def main() -> None:
                             "similarity_score": result["similarity_score"],
                             "intent_confidence": result["intent_confidence"],
                         }
-                        st.info(result["answer"]["text"])
-                        st.warning(
-                            "Found a similar question. Choose whether to reuse the previous SQL or generate a new one "
-                            "using the buttons below."
-                        )
+                        # Don't show duplicate messages here - they'll be shown in the confirmation UI below
+                        st.success("Similar question detected. Please choose an option below.")
                     else:
                         # Normal result display
-                        if result.get("execution_error"):
-                            st.warning(result["execution_error"])
-                        else:
-                            if result.get("plan", {}).get("sql_generation_note"):
-                                st.warning(result["plan"]["sql_generation_note"])
-                            st.success("Analysis complete.")
+                        if not force_new and not result.get("similar_question_found"):
+                            st.info("No similar saved question found. Generating a fresh analysis.")
+                    if result.get("execution_error"):
+                        st.warning(result["execution_error"])
+                    else:
+                        if result.get("plan", {}).get("sql_generation_note"):
+                            st.warning(result["plan"]["sql_generation_note"])
+                        st.success("Analysis complete.")
                         
                         # Handle answer display (could be dict or string)
                         answer_text = result.get("answer", {})
                         if isinstance(answer_text, dict):
                             answer_text = answer_text.get("text", "")
                         st.markdown(answer_text)
-                        
-                        # Display the full prompt and final SQL
-                        if result.get("formatted_prompt") or result.get("final_sql"):
-                            with st.expander("📋 Full Prompt & Final SQL (After Intent Critic/Repair)", expanded=False):
-                                if result.get("final_sql"):
-                                    st.subheader("Final SQL (After All Intent Repairs)")
-                                    st.caption("This is the SQL that will be executed, after all intent critic/repair iterations.")
-                                    st.code(result["final_sql"], language="sql")
-                                    st.divider()
-                                
-                                if result.get("formatted_prompt"):
-                                    st.subheader("Full Planner Prompt")
-                                    st.caption("This is the complete prompt including all graph context (tables, columns, relationships) that was sent to the planner LLM to generate the SQL query. This prompt is logged at INFO level in the application logs.")
-                                    st.code(result["formatted_prompt"], language="text")
-                        
-                        if result.get("plan"):
-                            with st.expander("LLM Plan", expanded=False):
-                                st.json(result["plan"])
-                        if result.get("followups"):
-                            st.markdown("**Suggested follow-ups:**")
-                            for item in result["followups"]:
-                                st.markdown(f"- {item}")
-                        if not result.get("execution_error"):
-                            render_executions(result)
-                        st.session_state["conversation_history"] = service.get_conversation()
-                        st.session_state["saved_queries"] = service.list_saved_queries()
-                        st.session_state["saved_query_message"] = None
+                    
+                    # Display the full prompt and final SQL
+                    if result.get("formatted_prompt") or result.get("final_sql"):
+                        with st.expander("📋 Full Prompt & Final SQL (After Intent Critic/Repair)", expanded=False):
+                            if result.get("final_sql"):
+                                st.subheader("Final SQL (After All Intent Repairs)")
+                                st.caption("This is the SQL that will be executed, after all intent critic/repair iterations.")
+                                st.code(result["final_sql"], language="sql")
+                                st.divider()
+                            
+                            if result.get("formatted_prompt"):
+                                st.subheader("Full Planner Prompt")
+                                st.caption("This is the complete prompt including all graph context (tables, columns, relationships) that was sent to the planner LLM to generate the SQL query. This prompt is logged at INFO level in the application logs.")
+                                st.code(result["formatted_prompt"], language="text")
+                    
+                    if result.get("plan"):
+                        with st.expander("LLM Plan", expanded=False):
+                            st.json(result["plan"])
+                    if result.get("followups"):
+                        st.markdown("**Suggested follow-ups:**")
+                        for item in result["followups"]:
+                            st.markdown(f"- {item}")
+                    if not result.get("execution_error"):
+                        render_executions(result)
+                    st.session_state["conversation_history"] = service.get_conversation()
+                    st.session_state["saved_queries"] = service.list_saved_queries()
+                    st.session_state["saved_query_message"] = None
 
     # Display saved query result (from "Yes, reuse previous query" or saved queries panel)
     # Show confirmation UI if similar question detected
@@ -1419,7 +1606,7 @@ def main() -> None:
                 st.session_state["similar_question_confirmation"] = None
                 st.session_state["force_new_query"] = True
                 st.rerun()
-    
+
     saved_result = st.session_state.get("saved_query_result")
     if saved_result:
         st.divider()
@@ -1429,7 +1616,11 @@ def main() -> None:
         # Display answer text
         answer_text = saved_result.get("answer", "")
         if answer_text:
-            st.markdown(f"**Answer:** {answer_text}")
+            # Handle both dict and string formats
+            if isinstance(answer_text, dict):
+                answer_text = answer_text.get("text", "") or str(answer_text)
+            if answer_text:
+                st.markdown(f"**Answer:** {answer_text}")
         # Display SQL that was executed
         if saved_result.get("sql"):
             with st.expander("📋 Executed SQL", expanded=True):

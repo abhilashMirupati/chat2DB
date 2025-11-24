@@ -194,6 +194,13 @@ class AppConfig(BaseSettings):
         ge=5,
         le=50,
     )
+    max_repair_iterations: int = Field(
+        default=2,
+        description="Maximum number of repair iterations for both intent critic/repair (pre-execution) and post-execution critic/repair. "
+        "Each iteration includes one critic check and one repair attempt.",
+        ge=1,
+        le=5,
+    )
 
     model_config = SettingsConfigDict(
         env_prefix="SQLAI_",

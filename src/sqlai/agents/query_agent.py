@@ -32,6 +32,7 @@ from sqlai.llm.prompt_templates import (
     CRITIC_PROMPT,
     REPAIR_PROMPT,
     INTENT_CRITIC_PROMPT,
+    ANALYSIS_PROMPT,
 )
 from sqlai.agents.guard import repair_sql, validate_sql
 from sqlai.graph.context import GraphContext
@@ -42,9 +43,111 @@ import sqlglot
 
 LOGGER = logging.getLogger(__name__)
 
-MAX_INTENT_REPAIRS = 3
+# Default max repairs (can be overridden by config)
+MAX_INTENT_REPAIRS = 2
 RE_REASONING_BLOCK = re.compile(r"<think>.*?</think>", re.IGNORECASE | re.DOTALL)
 RE_LEADING_FENCE = re.compile(r"^```(?:json)?", re.IGNORECASE)
+
+
+def _format_desired_columns_hint(desired_columns: Optional[List[str]], raw_columns: Optional[List[str]] = None) -> str:
+    """Format desired columns for prompt hints."""
+    # Prefer raw user input (allows synonyms), fallback to validated
+    columns_to_show = raw_columns if raw_columns else desired_columns
+    if not columns_to_show:
+        return "No specific column preferences. Include all relevant columns needed to answer the question."
+    
+    hint_text = (
+        f"The user explicitly requested these columns in the results: {', '.join(columns_to_show)}. "
+        f"**CRITICAL: Map these to actual column names from the Graph Context and ensure ALL of them are included in the SELECT clause** "
+        f"(with appropriate table aliases/qualifiers if needed). If a column requires a JOIN, add that JOIN using FK paths.\n\n"
+        f"**SYNONYM MAPPING GUIDANCE:**\n"
+        f"- If the user used synonyms or natural language (e.g., 'test set name' instead of 'name'), map them to the correct column names from the available tables.\n"
+        f"- Consider table context: if the user says 'test set' and there's a table like 'test_sets_real_data', map to columns from that table.\n"
+        f"- Use semantic matching: 'test set name' likely refers to a 'name' column in a test_sets-related table.\n"
+        f"- Match based on the question context and the selected tables in the Graph Context."
+    )
+    
+    # Add validated hints if available and different from raw
+    if desired_columns and raw_columns and set(desired_columns) != set(raw_columns):
+        hint_text += f"\n\nValidated column matches: {', '.join(desired_columns)} (use these as reference for mapping)."
+    
+    return hint_text
+
+
+def _format_desired_columns_section(desired_columns: Optional[List[str]], raw_columns: Optional[List[str]] = None) -> str:
+    """Format desired columns as a section in prompts."""
+    # Prefer raw user input (allows synonyms), fallback to validated
+    columns_to_show = raw_columns if raw_columns else desired_columns
+    if not columns_to_show:
+        return ""
+    
+    section = f"\n\n[USER DESIRED COLUMNS]\nThe user explicitly wants these columns in the results: {', '.join(columns_to_show)}\n\n"
+    section += "**IMPORTANT - SYNONYM & CONTEXT MAPPING:**\n"
+    section += "1. Map these to actual column names from the Graph Context (the user may have used synonyms or natural language).\n"
+    section += "2. **Consider table context**: If the user says 'test set' and there's a table like 'test_sets_real_data' in the selected tables, "
+    section += "map to columns from that table (e.g., 'test set name' → 'test_sets_real_data.name').\n"
+    section += "3. Use semantic matching: Match user terms to actual column names based on:\n"
+    section += "   - The question context (what tables are relevant)\n"
+    section += "   - The selected tables in Graph Context\n"
+    section += "   - Column names and their meanings from TABLE CARDS and COLUMN CARDS\n"
+    section += "4. Include ALL of these columns in the SELECT clause with appropriate table aliases/qualifiers.\n"
+    section += "5. If a column requires a JOIN, add that JOIN using FK paths from RELATIONSHIP_MAP.\n"
+    
+    # Add validated hints if available
+    if desired_columns and raw_columns and set(desired_columns) != set(raw_columns):
+        section += f"\nValidated matches (for reference): {', '.join(desired_columns)}\n"
+    
+    return section
+
+
+def _format_query_analysis_section(query_analysis: Dict[str, Any]) -> str:
+    """Format query analysis (TODO list and checklist) for prompts."""
+    if not query_analysis:
+        return ""
+    
+    parts = []
+    
+    # Analysis summary
+    analysis = query_analysis.get("analysis", "")
+    if analysis:
+        parts.append(f"[QUERY ANALYSIS]\n{analysis}\n")
+    
+    # TODO list
+    todo_list = query_analysis.get("todo_list", [])
+    if todo_list:
+        parts.append("[TODO LIST - Steps to Complete]")
+        for idx, todo in enumerate(todo_list, 1):
+            parts.append(f"{idx}. {todo}")
+        parts.append("")
+    
+    # Verification checklist
+    checklist = query_analysis.get("verification_checklist", [])
+    if checklist:
+        parts.append("[VERIFICATION CHECKLIST - Verify After SQL Generation]")
+        for item in checklist:
+            parts.append(f"✓ {item}")
+        parts.append("")
+    
+    # Potential pitfalls
+    pitfalls = query_analysis.get("potential_pitfalls", [])
+    if pitfalls:
+        parts.append("[POTENTIAL PITFALLS - Avoid These Mistakes]")
+        for pitfall in pitfalls:
+            parts.append(f"⚠ {pitfall}")
+        parts.append("")
+    
+    # Complex requirements
+    complex_reqs = query_analysis.get("complex_requirements", [])
+    if complex_reqs:
+        parts.append("[COMPLEX REQUIREMENTS - SQL Features Needed]")
+        for req in complex_reqs:
+            parts.append(f"→ {req}")
+        parts.append("")
+    
+    if not parts:
+        return ""
+    
+    return "\n".join(parts)
 
 
 def _strip_reasoning_wrappers(text: str) -> str:
@@ -54,6 +157,11 @@ def _strip_reasoning_wrappers(text: str) -> str:
     """
     if not text:
         return text
+    # Normalize bytes to string (works with any LLM model)
+    if isinstance(text, bytes):
+        text = text.decode('utf-8', errors='ignore')
+    elif not isinstance(text, str):
+        text = str(text)
     cleaned = text.strip()
     if "<think>" in cleaned.lower():
         cleaned = RE_REASONING_BLOCK.sub("", cleaned)
@@ -69,6 +177,11 @@ def _extract_first_json_object(text: str) -> Optional[str]:
     """
     if not text:
         return None
+    # Normalize bytes to string (works with any LLM model)
+    if isinstance(text, bytes):
+        text = text.decode('utf-8', errors='ignore')
+    elif not isinstance(text, str):
+        text = str(text)
     start = None
     depth = 0
     for idx, ch in enumerate(text):
@@ -82,6 +195,232 @@ def _extract_first_json_object(text: str) -> Optional[str]:
                 if depth == 0 and start is not None:
                     return text[start : idx + 1]
     return None
+
+
+def _extract_sql_from_malformed_json(text: str, field_name: str = "sql") -> Optional[str]:
+    """
+    Robustly extract SQL from malformed JSON text.
+    Handles:
+    - Complex SQL with nested quotes (single and double)
+    - Multi-line SQL
+    - Escaped characters
+    - SQL in array format: ["SELECT ..."]
+    - Arrays of objects with statement field: [{"description": "...", "statement": "SQL"}]
+    - Malformed JSON (missing closing quotes, braces, etc.)
+    - SQL with CTEs, subqueries, etc.
+    - Null/empty values
+    - Wrong field types (number, object, etc.)
+    - Multiple array elements (takes first)
+    
+    Args:
+        text: The raw JSON text to extract from
+        field_name: The JSON field name to extract (default: "sql", can be "patched_sql")
+    """
+    if not text:
+        return None
+    
+    # Normalize bytes to string (works with any LLM model)
+    if isinstance(text, bytes):
+        text = text.decode('utf-8', errors='ignore')
+    elif not isinstance(text, str):
+        text = str(text)
+    
+    # Normalize text (handle None, empty, whitespace)
+    text = text.strip()
+    if not text:
+        return None
+    
+    # Strategy 1: Find the specified field and extract value using balanced quote matching
+    sql_key_pattern = rf'"{field_name}"\s*:\s*'
+    sql_key_match = re.search(sql_key_pattern, text, re.IGNORECASE)
+    if sql_key_match:
+        start_pos = sql_key_match.end()
+        remaining = text[start_pos:].lstrip()
+        
+        # Handle null/empty: "sql": null or "sql": ""
+        if remaining.startswith('null') or remaining.startswith('""'):
+            return None
+        
+        # Try array format first: ["SQL"] or ["SQL1", "SQL2"] or [{"description": "...", "statement": "SQL"}]
+        if remaining.startswith('['):
+            # First, try to extract array of strings: ["SQL"]
+            quote_start = remaining.find('"', 1)
+            if quote_start > 0:
+                extracted = _extract_quoted_string(remaining, quote_start)
+                if extracted and _is_valid_sql(extracted):
+                    return extracted
+            # Try to extract first element from array with multiple string elements
+            # Pattern: ["SQL1", "SQL2", ...]
+            array_match = re.search(r'\[\s*"((?:[^"\\]|\\.)*)"', remaining, re.DOTALL)
+            if array_match:
+                extracted = _unescape_json_string(array_match.group(1))
+                if _is_valid_sql(extracted):
+                    return extracted
+            # Try to extract from array of objects with statement field: [{"description": "...", "statement": "SQL"}]
+            # Pattern: [{"description": "...", "statement": "SQL"}]
+            statement_pattern = r'\[\s*\{[^}]*"statement"\s*:\s*"((?:[^"\\]|\\.)*)"'
+            statement_match = re.search(statement_pattern, remaining, re.DOTALL | re.IGNORECASE)
+            if statement_match:
+                extracted = _unescape_json_string(statement_match.group(1))
+                if _is_valid_sql(extracted):
+                    LOGGER.debug("Extracted SQL from object with 'statement' field in array (robust extraction)")
+                    return extracted
+        
+        # Try string format: "SQL"
+        if remaining.startswith('"'):
+            extracted = _extract_quoted_string(remaining, 0)
+            if extracted and _is_valid_sql(extracted):
+                return extracted
+        
+        # Handle wrong types: "sql": 123 or "sql": {...}
+        # Skip these as they're not valid SQL
+        if remaining.startswith(('{', '0', '1', '2', '3', '4', '5', '6', '7', '8', '9', '-', 'true', 'false')):
+            LOGGER.debug("Field '%s' has wrong type (not string), skipping", field_name)
+            return None
+    
+    # Strategy 2: Use regex patterns for common formats (fallback)
+    # Array of objects with statement field: "field_name": [{"description": "...", "statement": "SQL"}]
+    statement_obj_pattern = rf'"{field_name}"\s*:\s*\[\s*\{{[^}}]*"statement"\s*:\s*"((?:[^"\\]|\\.)*)"'
+    sql_patterns = [
+        # Array of objects with statement field
+        statement_obj_pattern,
+        # Array format: "field_name": ["SELECT ..."] or ["SQL1", "SQL2"]
+        rf'"{field_name}"\s*:\s*\[\s*"((?:[^"\\]|\\.)*)"',
+        # String format with proper escaping: "field_name": "SELECT ..."
+        rf'"{field_name}"\s*:\s*"((?:[^"\\]|\\.)*)"',
+        # Simple format (may fail on complex SQL): "field_name": "SELECT ..."
+        rf'"{field_name}"\s*:\s*"([^"]*)"',
+    ]
+    
+    for pattern in sql_patterns:
+        sql_match = re.search(pattern, text, re.DOTALL | re.MULTILINE)
+        if sql_match:
+            extracted = sql_match.group(1)
+            # Unescape common escape sequences
+            extracted = _unescape_json_string(extracted)
+            if extracted and _is_valid_sql(extracted):
+                return extracted
+    
+    return None
+
+
+def _extract_quoted_string(text: str, start_pos: int) -> Optional[str]:
+    """
+    Extract a quoted string starting at start_pos, handling escaped quotes and newlines.
+    Returns the unescaped string content.
+    """
+    if start_pos >= len(text) or text[start_pos] != '"':
+        return None
+    
+    i = start_pos + 1  # Skip opening quote
+    result = []
+    escaped = False
+    
+    while i < len(text):
+        char = text[i]
+        
+        if escaped:
+            # Handle escape sequences
+            if char == 'n':
+                result.append('\n')
+            elif char == 't':
+                result.append('\t')
+            elif char == 'r':
+                result.append('\r')
+            elif char in ['"', '\\', '/']:
+                result.append(char)
+            else:
+                # Unknown escape, keep as-is
+                result.append('\\')
+                result.append(char)
+            escaped = False
+        elif char == '\\':
+            escaped = True
+        elif char == '"':
+            # Found closing quote
+            extracted = ''.join(result)
+            if _is_valid_sql(extracted):
+                return extracted
+            return None
+        else:
+            result.append(char)
+        
+        i += 1
+    
+    # No closing quote found (malformed JSON), but return what we have if it looks like SQL
+    extracted = ''.join(result)
+    if _is_valid_sql(extracted):
+        return extracted
+    
+    return None
+
+
+def _unescape_json_string(text: str) -> str:
+    """Unescape common JSON escape sequences."""
+    if not text:
+        return text
+    # Handle common escape sequences
+    text = text.replace('\\"', '"')
+    text = text.replace('\\n', '\n')
+    text = text.replace('\\t', '\t')
+    text = text.replace('\\r', '\r')
+    text = text.replace('\\\\', '\\')
+    text = text.replace('\\/', '/')
+    return text.strip()
+
+
+def _is_valid_sql(text: str) -> bool:
+    """
+    Check if extracted text looks like valid SQL.
+    Handles edge cases: empty, None, wrong types, JSON artifacts, error messages.
+    """
+    # Handle None, empty, wrong types
+    if not text or not isinstance(text, str):
+        return False
+    
+    text_stripped = text.strip()
+    if len(text_stripped) < 10:
+        return False
+    
+    text_upper = text_stripped.upper()
+    
+    # Must start with a SQL keyword (after any leading whitespace/newlines)
+    sql_keywords = ['SELECT', 'WITH', 'INSERT', 'UPDATE', 'DELETE', 'CREATE', 'ALTER', 'DROP']
+    if not any(text_upper.startswith(kw) for kw in sql_keywords):
+        return False
+    
+    # Must contain FROM (for SELECT) or other indicators
+    if 'SELECT' in text_upper and 'FROM' not in text_upper:
+        # Could be a subquery, check for other patterns
+        if 'WHERE' not in text_upper and 'JOIN' not in text_upper and 'UNION' not in text_upper:
+            # Check if it's a CTE (WITH ... AS ...)
+            if 'WITH' in text_upper and 'AS' in text_upper:
+                return True
+            return False
+    
+    # Should not be just JSON structure or error messages
+    invalid_patterns = [
+        '"SQL"', '{"SQL"', '"SQL":',  # JSON artifacts
+        'ERROR', 'EXCEPTION', 'FAILED',  # Error messages
+        'INVALID JSON', 'FOR TROUBLESHOOTING',  # LangChain error messages
+        'JSON', 'PARSE',  # Parsing artifacts
+    ]
+    # Only reject if these patterns appear at the start (likely error messages)
+    # Allow them in the middle (could be in SQL strings/comments)
+    for pattern in invalid_patterns:
+        if text_upper.startswith(pattern) or text_upper[:50].startswith(pattern):
+            return False
+    
+    # Should contain at least one table reference or common SQL pattern
+    sql_indicators = ['FROM', 'INTO', 'TABLE', 'JOIN', 'WHERE', 'GROUP BY', 'ORDER BY', 'HAVING', 'UNION']
+    if not any(indicator in text_upper for indicator in sql_indicators):
+        # Might be a simple expression, check for basic SQL structure
+        if 'SELECT' in text_upper and ('(' in text_stripped or ')' in text_stripped):
+            # Could be SELECT with function calls
+            return True
+        return False
+    
+    return True
 
 
 def _safe_invoke_json(chain: Any, payload: Dict[str, Any], llm: Any) -> Dict[str, Any]:
@@ -101,33 +440,86 @@ def _safe_invoke_json(chain: Any, payload: Dict[str, Any], llm: Any) -> Dict[str
         except Exception:  # pragma: no cover
             fixer = None
     
-    # Extract the prompt and LLM from chain to get raw response
-    # Chain structure: prompt | llm | parser
-    # We need to invoke prompt | llm to get raw response
+    # CRITICAL: Always get raw LLM response FIRST before parsing
+    # This ensures we have the actual LLM output even if JSON parsing fails
     raw_content = ""
-    try:
-        # Try to get raw response by invoking without parser
-        # Extract components from chain if possible
-        if hasattr(chain, "first") and hasattr(chain, "middle") and hasattr(chain, "last"):
-            # Chain is likely a RunnableSequence
-            prompt_part = chain.first if hasattr(chain, "first") else None
-            llm_part = chain.middle[0] if hasattr(chain, "middle") and len(chain.middle) > 0 else llm
-            if prompt_part and llm_part:
-                raw_response = (prompt_part | llm_part).invoke(payload)
-                raw_content = getattr(raw_response, "content", str(raw_response)) or ""
-        else:
-            # Fallback: try invoking the full chain and see if we can extract raw content
-            result = chain.invoke(payload)
-            # If result is already parsed (dict), we lost the raw content
-            if isinstance(result, dict):
-                # Try to get raw by re-invoking without parser
-                # This is a best-effort approach
-                pass
-            elif hasattr(result, "content"):
-                raw_content = getattr(result, "content", None) or ""
-    except Exception:
-        pass  # Will try chain.invoke below
+    prompt_part = None
+    llm_part = None
     
+    # Try multiple strategies to extract prompt and LLM from chain
+    try:
+        # Strategy 1: Check if chain has first/middle/last (RunnableSequence)
+        if hasattr(chain, "first") and hasattr(chain, "middle") and hasattr(chain, "last"):
+            prompt_part = chain.first
+            if hasattr(chain, "middle") and len(chain.middle) > 0:
+                llm_part = chain.middle[0]
+            else:
+                llm_part = llm
+            LOGGER.debug("Extracted prompt/llm using Strategy 1 (first/middle/last)")
+        # Strategy 2: Check if chain has steps (alternative structure)
+        elif hasattr(chain, "steps") and isinstance(chain.steps, (list, tuple)) and len(chain.steps) >= 2:
+            prompt_part = chain.steps[0]
+            llm_part = chain.steps[1]
+            LOGGER.debug("Extracted prompt/llm using Strategy 2 (steps)")
+        # Strategy 3: Try to access internal structure (for LangChain RunnableSequence)
+        elif hasattr(chain, "__dict__"):
+            # Look for prompt and llm in the chain's internal structure
+            chain_dict = chain.__dict__
+            if "first" in chain_dict:
+                prompt_part = chain_dict["first"]
+            if "middle" in chain_dict and isinstance(chain_dict["middle"], (list, tuple)) and len(chain_dict["middle"]) > 0:
+                llm_part = chain_dict["middle"][0]
+            if prompt_part or llm_part:
+                LOGGER.debug("Extracted prompt/llm using Strategy 3 (__dict__)")
+        
+        # ALWAYS invoke prompt|llm first to get raw response (before parsing)
+        if prompt_part and llm_part:
+            try:
+                raw_response = (prompt_part | llm_part).invoke(payload)
+                # Robust extraction: try multiple attributes and methods
+                if hasattr(raw_response, "content"):
+                    raw_content = raw_response.content or ""
+                elif hasattr(raw_response, "text"):
+                    raw_content = raw_response.text or ""
+                elif hasattr(raw_response, "message"):
+                    msg = raw_response.message
+                    if hasattr(msg, "content"):
+                        raw_content = msg.content or ""
+                    elif isinstance(msg, str):
+                        raw_content = msg
+                elif isinstance(raw_response, str):
+                    raw_content = raw_response
+                elif isinstance(raw_response, dict):
+                    raw_content = raw_response.get("content") or raw_response.get("text") or raw_response.get("message") or ""
+                else:
+                    raw_content = str(raw_response) if raw_response else ""
+                
+                # Normalize to string (handle bytes)
+                if raw_content:
+                    if isinstance(raw_content, bytes):
+                        raw_content = raw_content.decode('utf-8', errors='ignore')
+                    elif not isinstance(raw_content, str):
+                        raw_content = str(raw_content)
+                
+                if not raw_content:
+                    LOGGER.warning("Raw response extraction failed. Response type: %s, has content: %s, has text: %s",
+                                 type(raw_response).__name__,
+                                 hasattr(raw_response, "content"),
+                                 hasattr(raw_response, "text"))
+                
+                LOGGER.debug("Captured raw LLM response BEFORE parsing (length: %d)", len(raw_content) if raw_content else 0)
+            except Exception as raw_exc:
+                LOGGER.warning("Failed to get raw response from prompt|llm: %s", raw_exc)
+        else:
+            LOGGER.warning("Could not extract prompt/llm from chain structure. Chain type: %s, has first: %s, has middle: %s, has steps: %s", 
+                         type(chain).__name__, 
+                         hasattr(chain, "first"), 
+                         hasattr(chain, "middle"), 
+                         hasattr(chain, "steps"))
+    except Exception as extract_exc:
+        LOGGER.warning("Failed to extract prompt/llm from chain: %s", extract_exc)
+    
+    # Now try to parse (this may throw an exception, but we already have raw_content)
     try:
         result = chain.invoke(payload)
         # Attach raw content if we captured it
@@ -151,21 +543,109 @@ def _safe_invoke_json(chain: Any, payload: Dict[str, Any], llm: Any) -> Dict[str
     except Exception as exc:
         # Try to obtain raw content and repair it
         if not raw_content:
-            try:
-                # Try to extract prompt and llm from chain
-                if hasattr(chain, "first") and hasattr(chain, "middle"):
-                    prompt_part = chain.first
-                    llm_part = chain.middle[0] if len(chain.middle) > 0 else llm
-                    if prompt_part and llm_part:
-                        raw_response = (prompt_part | llm_part).invoke(payload)
-                        raw_content = getattr(raw_response, "content", str(raw_response)) or ""
-            except Exception:
-                pass
+            # Last resort: try to invoke prompt|llm again if we have them
+            if prompt_part and llm_part:
+                try:
+                    raw_response = (prompt_part | llm_part).invoke(payload)
+                    # Use same robust extraction logic
+                    if hasattr(raw_response, "content"):
+                        raw_content = raw_response.content or ""
+                    elif hasattr(raw_response, "text"):
+                        raw_content = raw_response.text or ""
+                    elif isinstance(raw_response, str):
+                        raw_content = raw_response
+                    else:
+                        raw_content = str(raw_response) if raw_response else ""
+                except Exception:
+                    pass
+        
+        # Try to extract raw response from exception if we don't have it yet
+        if not raw_content:
+            # LangChain's OutputParserException may have the response in various attributes
+            # Try partial_output first (common in OutputParserException)
+            if hasattr(exc, "partial_output") and exc.partial_output:
+                if isinstance(exc.partial_output, str):
+                    raw_content = exc.partial_output
+                elif hasattr(exc.partial_output, "content"):
+                    raw_content = getattr(exc.partial_output, "content", "")
+            # Try llm_output attribute
+            elif hasattr(exc, "llm_output") and exc.llm_output:
+                if isinstance(exc.llm_output, dict) and "text" in exc.llm_output:
+                    raw_content = exc.llm_output["text"]
+                elif isinstance(exc.llm_output, str):
+                    raw_content = exc.llm_output
+            # Try response attribute
+            elif hasattr(exc, "response") and exc.response:
+                if hasattr(exc.response, "content"):
+                    raw_content = getattr(exc.response, "content", "")
+                elif isinstance(exc.response, str):
+                    raw_content = exc.response
+            # Check if exception args contain the response (first arg is often the response)
+            elif hasattr(exc, "args") and exc.args and len(exc.args) > 0:
+                first_arg = exc.args[0]
+                if isinstance(first_arg, str) and len(first_arg) > 100 and "Invalid json output" not in first_arg:
+                    # If first arg is a long string and not just an error message, it might be the response
+                    raw_content = first_arg
+                elif hasattr(first_arg, "content"):
+                    raw_content = getattr(first_arg, "content", "")
+            # Check if exception has a message that contains the raw response
+            elif hasattr(exc, "message") and exc.message:
+                msg_str = str(exc.message)
+                # Only use message if it's not just an error message
+                if len(msg_str) > 100 and "Invalid json output" not in msg_str and "For troubleshooting" not in msg_str:
+                    raw_content = msg_str
+            # Check if exception has raw_response attribute
+            elif hasattr(exc, "raw_response"):
+                raw_content = str(exc.raw_response)
+        
+        # Normalize raw_content to string (handle bytes)
+        if raw_content:
+            if isinstance(raw_content, bytes):
+                raw_content = raw_content.decode('utf-8', errors='ignore')
+            elif not isinstance(raw_content, str):
+                raw_content = str(raw_content)
+        
+        # Filter out error messages - don't use exception string if it's just an error message
+        if raw_content and ("Invalid json output" in raw_content or "For troubleshooting" in raw_content):
+            # This is just an error message, not the actual LLM response
+            LOGGER.warning("Raw content appears to be an error message, not LLM response. Length: %d", len(raw_content))
+            raw_content = ""  # Clear it so we try other methods
         
         sanitized = _strip_reasoning_wrappers(raw_content)
         if not sanitized:
-            LOGGER.warning("Could not extract raw LLM response for JSON repair. Exception: %s", exc)
-            return {"verdict": "reject", "reasons": [], "repair_hints": [], "__raw": None}
+            LOGGER.warning("Could not extract raw LLM response for JSON repair. Exception type: %s, Exception: %s", type(exc).__name__, exc)
+            # If we still don't have raw_content, try one more time to invoke prompt|llm directly
+            if not raw_content and prompt_part and llm_part:
+                try:
+                    LOGGER.debug("Making final attempt to get raw response from prompt|llm")
+                    raw_response = (prompt_part | llm_part).invoke(payload)
+                    # Use same robust extraction logic
+                    if hasattr(raw_response, "content"):
+                        raw_content = raw_response.content or ""
+                    elif hasattr(raw_response, "text"):
+                        raw_content = raw_response.text or ""
+                    elif isinstance(raw_response, str):
+                        raw_content = raw_response
+                    else:
+                        raw_content = str(raw_response) if raw_response else ""
+                    
+                    # Normalize to string (handle bytes)
+                    if raw_content:
+                        if isinstance(raw_content, bytes):
+                            raw_content = raw_content.decode('utf-8', errors='ignore')
+                        elif not isinstance(raw_content, str):
+                            raw_content = str(raw_content)
+                    
+                    if raw_content:
+                        LOGGER.info("Successfully captured raw response on final attempt (length: %d)", len(raw_content))
+                        sanitized = _strip_reasoning_wrappers(raw_content)
+                except Exception as final_exc:
+                    LOGGER.warning("Final attempt to get raw response also failed: %s", final_exc)
+            
+            if not sanitized:
+                # Return a structure that matches what the caller expects based on context
+                # For repair calls, return patched_sql structure; for critic, return verdict structure
+                return {"patched_sql": "", "what_changed": [], "why": f"Failed to extract raw LLM response. Exception: {type(exc).__name__}: {exc}", "__raw": None}
         
         try:
             if fixer is not None:
@@ -180,7 +660,8 @@ def _safe_invoke_json(chain: Any, payload: Dict[str, Any], llm: Any) -> Dict[str
             return repaired
         except Exception as repair_exc:
             LOGGER.debug("JSON repair failed: %s. Raw content: %s", repair_exc, raw_content[:500] if raw_content else "<<empty>>")
-            return {"verdict": "reject", "reasons": [], "repair_hints": [], "__raw": raw_content}
+            # Return appropriate structure based on context
+            return {"patched_sql": "", "what_changed": [], "why": f"JSON repair failed: {repair_exc}", "__raw": raw_content}
 
 
 def _best_effort_json_repair(text: str) -> Dict[str, Any]:
@@ -228,6 +709,9 @@ class QueryState(TypedDict, total=False):
     graph_context: Optional[GraphContext]
     critic: Dict[str, Any]
     repair_attempts: int
+    desired_columns: List[str]  # Validated column names (for hints)
+    desired_columns_raw: List[str]  # Raw user input (for LLM to map synonyms/aliases)
+    query_analysis: Dict[str, Any]  # Analysis results: todo_list, verification_checklist, potential_pitfalls, etc.
 
 
 def _route_after_intent(state: QueryState) -> str:
@@ -324,6 +808,67 @@ def format_schema_markdown(schema: List[Dict[str, Any]]) -> str:
         if summary.get("row_estimate"):
             lines.append(f"- row_estimate: {summary['row_estimate']}")
     return "\n".join(lines)
+
+
+def _build_rich_graph_context_for_repair(state: QueryState) -> str:
+    """
+    Build a rich Graph Context for repair steps that includes:
+    - Table cards with full column details
+    - Column cards with types, nullable, sample values
+    - Column facts (distinct counts, min/max)
+    - Relationship map (FK paths)
+    - Value anchors (sample values for filters)
+    
+    This provides much more context than the simplified schema_markdown.
+    """
+    prompt_inputs = state.get("prompt_inputs") or {}
+    
+    # Build rich context from prompt_inputs (same as planner gets)
+    parts = []
+    
+    # Table cards (with full column details)
+    table_cards = prompt_inputs.get("table_cards", "")
+    if table_cards and table_cards != "None":
+        parts.append("TABLE CARDS:")
+        parts.append(table_cards)
+        parts.append("")
+    
+    # Column cards (with types, nullable, sample values)
+    column_cards = prompt_inputs.get("column_cards", "")
+    if column_cards and column_cards != "None":
+        parts.append("COLUMN CARDS:")
+        parts.append(column_cards)
+        parts.append("")
+    
+    # Column facts (distinct counts, min/max, null%)
+    column_facts = prompt_inputs.get("column_facts", "")
+    if column_facts and column_facts != "None":
+        parts.append("COLUMN FACTS (type, null%, distinct, min/max):")
+        parts.append(column_facts)
+        parts.append("")
+    
+    # Relationship map (FK paths)
+    relationship_map = prompt_inputs.get("relationship_map", "")
+    if relationship_map and relationship_map != "None":
+        parts.append("FOREIGN-KEY PATHS (high-confidence joins):")
+        parts.append(relationship_map)
+        parts.append("")
+    
+    # Value anchors (sample values for realistic filters)
+    value_anchors = prompt_inputs.get("value_anchors", "")
+    if value_anchors and value_anchors != "No value anchors collected.":
+        parts.append("VALUE ANCHORS (representative values for realistic filters):")
+        parts.append(value_anchors)
+        parts.append("")
+    
+    # Fallback to simplified schema_markdown if rich context not available
+    if not parts:
+        schema_markdown = state.get("schema_markdown", "")
+        if schema_markdown:
+            parts.append("SCHEMA SUMMARY:")
+            parts.append(schema_markdown)
+    
+    return "\n".join(parts) if parts else "No Graph Context available."
 
 
 def _fail():
@@ -497,12 +1042,21 @@ def _sanitize_sql_list(sql_statements: List[str]) -> List[str]:
     return cleaned or sql_statements[:1]
 
 
-def create_query_workflow(llm: Any, engine: Engine) -> Any:
+def create_query_workflow(llm: Any, engine: Engine, max_repair_iterations: int = 2) -> Any:
     """
     Compile a LangGraph for the SQL query workflow.
+    
+    Args:
+        llm: The language model to use for SQL generation and repair
+        engine: The database engine for SQL execution
+        max_repair_iterations: Maximum number of repair iterations (default: 2)
     """
+    # Set the global max repairs for this workflow instance
+    global MAX_INTENT_REPAIRS
+    MAX_INTENT_REPAIRS = max_repair_iterations
 
     graph = StateGraph(QueryState)
+    graph.add_node("analyze", _analyze_query(llm))
     graph.add_node("plan", _plan_sql(llm))
     graph.add_node("intent_critic", _intent_critic(llm))
     graph.add_node("intent_repair", _intent_repair(llm))
@@ -512,16 +1066,38 @@ def create_query_workflow(llm: Any, engine: Engine) -> Any:
     graph.add_node("summarise", _summarise(llm))
     graph.add_node("fail", _fail())
 
-    graph.set_entry_point("plan")
+    graph.set_entry_point("analyze")
+    graph.add_edge("analyze", "plan")
     # Route after planning: if no SQL, fail early with a clear message
     def _route_after_plan(state: QueryState) -> str:
+        """
+        Route after planner node.
+        - If SQL is empty after all extraction attempts (planner, robust extraction, bootstrap, fallback):
+          FAIL EARLY - no point going to critic/repair if we have no SQL at all.
+        - If SQL exists (even if incorrect/wrong), proceed to critic/repair - they will handle fixing it.
+        """
         plan = state.get("plan") or {}
         sql = plan.get("sql")
-        if not sql or (isinstance(sql, str) and not sql.strip()) or (isinstance(sql, list) and not any((s or "").strip() for s in sql)):
-            # ensure execution_error is set by planner node; if not, set a generic one
-            if not state.get("execution_error"):
-                state["execution_error"] = "Planner failed to produce SQL for the question."
+        
+        # Check if SQL is empty after all extraction attempts
+        sql_is_empty = False
+        if not sql:
+            sql_is_empty = True
+        elif isinstance(sql, str):
+            sql_is_empty = not sql.strip()
+        elif isinstance(sql, list):
+            sql_is_empty = not any((s or "").strip() for s in sql)
+        
+        if sql_is_empty:
+            # Planner failed to produce SQL even after robust extraction, bootstrap, and fallback
+            error_msg = plan.get("sql_generation_note") or "Planner did not produce proper SQL. The LLM failed to generate SQL even after multiple extraction attempts."
+            state["execution_error"] = error_msg
+            LOGGER.warning("Planner returned empty SQL after all extraction attempts. Failing early instead of proceeding to critic/repair. Error: %s", error_msg)
             return "fail"
+        
+        # SQL exists (even if it might be incorrect) - let critic/repair handle it
+        LOGGER.debug("Planner produced SQL (will be validated by critic/repair). SQL preview: %s", 
+                    (sql[0] if isinstance(sql, list) else sql)[:200] if sql else "")
         return "intent_critic"
     graph.add_conditional_edges("plan", _route_after_plan, {"intent_critic": "intent_critic", "fail": "fail"})
     graph.add_conditional_edges(
@@ -565,6 +1141,55 @@ def create_query_workflow(llm: Any, engine: Engine) -> Any:
     return graph.compile()
 
 
+def _analyze_query(llm: Any):
+    """
+    Analyze the user question and Graph Context to create a TODO list and verification checklist.
+    This helps the planner and repair steps avoid common mistakes.
+    """
+    parser = JsonOutputParser()
+    chain = ANALYSIS_PROMPT | llm | parser
+
+    def node(state: QueryState) -> QueryState:
+        prompt_inputs = state.get("prompt_inputs") or {}
+        question = state.get("question", "")
+        desired_columns = state.get("desired_columns") or []
+        desired_columns_raw = state.get("desired_columns_raw") or []
+        
+        # Build rich Graph Context for analysis
+        graph_text = _build_rich_graph_context_for_repair(state)
+        
+        result = _safe_invoke_json(
+            chain,
+            {
+                "question": question,
+                "graph": graph_text,
+                "dialect": state.get("dialect", ""),
+                "desired_columns_section": _format_desired_columns_section(desired_columns, desired_columns_raw),
+            },
+            llm,
+        )
+        
+        # Store analysis results in state
+        analysis = {
+            "analysis": result.get("analysis", ""),
+            "todo_list": result.get("todo_list", []),
+            "verification_checklist": result.get("verification_checklist", []),
+            "potential_pitfalls": result.get("potential_pitfalls", []),
+            "complex_requirements": result.get("complex_requirements", []),
+        }
+        
+        LOGGER.info("Query analysis completed: %d TODO items, %d checklist items, %d pitfalls identified",
+                   len(analysis.get("todo_list", [])),
+                   len(analysis.get("verification_checklist", [])),
+                   len(analysis.get("potential_pitfalls", [])))
+        
+        return {
+            "query_analysis": analysis,
+        }
+    
+    return node
+
+
 def _plan_sql(llm: Any):
     parser = JsonOutputParser()
     prompt = agent_prompt()
@@ -574,6 +1199,16 @@ def _plan_sql(llm: Any):
         LOGGER.debug("Planning SQL for question=%s", state.get("question"))
         prompt_inputs = dict(state.get("prompt_inputs") or {})
         prompt_inputs.setdefault("user_question", state.get("question", ""))
+        
+        # Add desired columns formatting (use raw input for LLM synonym mapping)
+        desired_columns = state.get("desired_columns") or []
+        desired_columns_raw = state.get("desired_columns_raw") or []
+        prompt_inputs["desired_columns_hint"] = _format_desired_columns_hint(desired_columns, desired_columns_raw)
+        prompt_inputs["desired_columns_section"] = _format_desired_columns_section(desired_columns, desired_columns_raw)
+        
+        # Add query analysis (TODO list and checklist) to help planner avoid mistakes
+        query_analysis = state.get("query_analysis") or {}
+        prompt_inputs["query_analysis_section"] = _format_query_analysis_section(query_analysis)
         
         # Log what's being passed to the prompt (summary)
         LOGGER.info("Prompt inputs summary: table_cards=%d chars, column_cards=%d chars, relationship_map=%d chars",
@@ -639,26 +1274,187 @@ def _plan_sql(llm: Any):
             formatted_prompt_text = f"[Error formatting prompt: {exc}]"
         
         # Invoke with robust JSON handling: try strict parser first, then auto-fix
+        # CRITICAL: Always capture raw response BEFORE parsing to ensure we have actual LLM output
         raw_planner_text = ""
+        sanitized_planner_text = ""
         try:
-            # Capture raw response first for diagnostics
+            # Capture raw response first for diagnostics (BEFORE parsing)
             raw_response = (prompt | llm).invoke(prompt_inputs)
-            raw_planner_text = getattr(raw_response, "content", str(raw_response)) or ""
-            LOGGER.debug("Planner raw LLM response (before parsing): %s", raw_planner_text[:500] if raw_planner_text else "<<empty>>")
+            
+            # Log the raw response object for debugging BEFORE extraction
+            LOGGER.debug("Planner response object type: %s, repr: %s", type(raw_response).__name__, repr(raw_response)[:500])
+            
+            # Robust extraction: try multiple attributes and methods
+            if hasattr(raw_response, "content"):
+                # Handle both string and list content (multimodal)
+                content = raw_response.content
+                if isinstance(content, list):
+                    # Extract text from multimodal content blocks
+                    text_parts = []
+                    for block in content:
+                        if isinstance(block, dict):
+                            if block.get("type") == "text":
+                                text_parts.append(block.get("text", ""))
+                            elif block.get("type") == "image_url":
+                                # Skip images, but log them
+                                LOGGER.debug("Skipping image block in response")
+                        elif isinstance(block, str):
+                            text_parts.append(block)
+                    raw_planner_text = "".join(text_parts)
+                elif isinstance(content, str):
+                    raw_planner_text = content
+                else:
+                    raw_planner_text = str(content) if content else ""
+                # Normalize to string (handle bytes)
+                if raw_planner_text:
+                    if isinstance(raw_planner_text, bytes):
+                        raw_planner_text = raw_planner_text.decode('utf-8', errors='ignore')
+                    elif not isinstance(raw_planner_text, str):
+                        raw_planner_text = str(raw_planner_text)
+                
+                LOGGER.debug("Extracted from .content attribute (length: %d, type: %s)", 
+                           len(raw_planner_text) if raw_planner_text else 0, type(content).__name__)
+            elif hasattr(raw_response, "text"):
+                raw_planner_text = raw_response.text or ""
+                LOGGER.debug("Extracted from .text attribute (length: %d)", len(raw_planner_text))
+            elif hasattr(raw_response, "message"):
+                msg = raw_response.message
+                if hasattr(msg, "content"):
+                    raw_planner_text = msg.content or ""
+                    LOGGER.debug("Extracted from .message.content (length: %d)", len(raw_planner_text))
+                elif isinstance(msg, str):
+                    raw_planner_text = msg
+                    LOGGER.debug("Extracted from .message as string (length: %d)", len(raw_planner_text))
+            elif isinstance(raw_response, str):
+                raw_planner_text = raw_response
+                LOGGER.debug("Response is string (length: %d)", len(raw_planner_text))
+            elif isinstance(raw_response, dict):
+                # Try common keys
+                raw_planner_text = raw_response.get("content") or raw_response.get("text") or raw_response.get("message") or ""
+                LOGGER.debug("Extracted from dict (length: %d), keys: %s", len(raw_planner_text), list(raw_response.keys())[:10])
+            else:
+                # Last resort: convert to string
+                raw_planner_text = str(raw_response) if raw_response else ""
+                LOGGER.debug("Extracted via str() conversion (length: %d)", len(raw_planner_text))
+            
+            # Also check response_metadata for raw response (some LangChain versions store it there)
+            if not raw_planner_text and hasattr(raw_response, "response_metadata"):
+                try:
+                    metadata = raw_response.response_metadata
+                    if isinstance(metadata, dict):
+                        # Check for raw response in metadata
+                        if "raw_response" in metadata:
+                            raw_resp = metadata["raw_response"]
+                            if hasattr(raw_resp, "choices") and len(raw_resp.choices) > 0:
+                                choice = raw_resp.choices[0]
+                                if hasattr(choice, "message") and hasattr(choice.message, "content"):
+                                    raw_planner_text = choice.message.content or ""
+                                    LOGGER.debug("Extracted from response_metadata.raw_response.choices[0].message.content (length: %d)", len(raw_planner_text))
+                except Exception as meta_exc:
+                    LOGGER.debug("Failed to extract from response_metadata: %s", meta_exc)
+            
+            # Normalize raw_planner_text to string (handle bytes) before any string operations
+            if raw_planner_text:
+                if isinstance(raw_planner_text, bytes):
+                    raw_planner_text = raw_planner_text.decode('utf-8', errors='ignore')
+                elif not isinstance(raw_planner_text, str):
+                    raw_planner_text = str(raw_planner_text)
+            
+            # Log response type for debugging if extraction failed
+            if not raw_planner_text:
+                LOGGER.warning("Planner response extraction failed. Response type: %s, has content: %s, has text: %s, str length: %d",
+                             type(raw_response).__name__,
+                             hasattr(raw_response, "content"),
+                             hasattr(raw_response, "text"),
+                             len(str(raw_response)) if raw_response else 0)
+                # Try to inspect the object more deeply
+                if hasattr(raw_response, "__dict__"):
+                    LOGGER.debug("Response object attributes: %s", list(raw_response.__dict__.keys()))
+                    # Log all attribute values (truncated)
+                    for attr in list(raw_response.__dict__.keys())[:10]:
+                        try:
+                            val = getattr(raw_response, attr)
+                            if isinstance(val, str):
+                                LOGGER.debug("  %s = %s (length: %d)", attr, val[:200], len(val))
+                            else:
+                                LOGGER.debug("  %s = %s (type: %s)", attr, repr(val)[:200], type(val).__name__)
+                        except Exception:
+                            pass
+                # Also try dir() to see all available methods/attributes
+                try:
+                    all_attrs = [x for x in dir(raw_response) if not x.startswith('_')]
+                    LOGGER.debug("Response object public attributes/methods: %s", all_attrs[:20])
+                except Exception:
+                    pass
+            
+            # Log the actual content (first 1000 chars) to see if SQL is there
+            if raw_planner_text:
+                LOGGER.info("Planner raw LLM response (length: %d): %s", 
+                           len(raw_planner_text),
+                           raw_planner_text[:1000])
+                # Check if SQL keywords are present
+                sql_keywords = ['SELECT', 'WITH', 'FROM', 'JOIN', 'WHERE', 'GROUP BY', 'ORDER BY']
+                found_keywords = [kw for kw in sql_keywords if kw in raw_planner_text.upper()]
+                if found_keywords:
+                    LOGGER.info("SQL keywords found in response: %s", found_keywords)
+                else:
+                    LOGGER.warning("No SQL keywords found in raw response")
+            else:
+                LOGGER.warning("Planner raw LLM response is EMPTY (length: 0)")
+            
+            # Filter out error messages - don't use if it's just an error message
+            if raw_planner_text and ("Invalid json output" in raw_planner_text or "For troubleshooting" in raw_planner_text):
+                LOGGER.warning("Planner raw response appears to be an error message, not LLM output. Attempting to re-invoke.")
+                # Try to get actual response
+                try:
+                    raw_response = (prompt | llm).invoke(prompt_inputs)
+                    # Use same robust extraction logic
+                    if hasattr(raw_response, "content"):
+                        raw_planner_text = raw_response.content or ""
+                    elif hasattr(raw_response, "text"):
+                        raw_planner_text = raw_response.text or ""
+                    elif isinstance(raw_response, str):
+                        raw_planner_text = raw_response
+                    else:
+                        raw_planner_text = str(raw_response) if raw_response else ""
+                except Exception:
+                    pass
+            
             sanitized_planner_text = _strip_reasoning_wrappers(raw_planner_text)
             if not sanitized_planner_text.strip():
                 LOGGER.warning("Planner LLM returned empty response. This may indicate a model compatibility issue.")
             plan = parser.parse(sanitized_planner_text)
         except Exception as parse_exc:
-            LOGGER.debug("Planner JSON parsing failed: %s. Raw response: %s", parse_exc, raw_planner_text[:500] if raw_planner_text else "<<empty>>")
-            # Fallback: attempt repair
+            LOGGER.debug("Planner JSON parsing failed: %s. Raw response length: %d", parse_exc, len(raw_planner_text) if raw_planner_text else 0)
+            # Fallback: attempt repair using raw response we already captured
             try:
                 if not raw_planner_text:
-                    # Re-invoke if we don't have raw text yet
+                    # Re-invoke if we don't have raw text yet (shouldn't happen, but safety check)
+                    LOGGER.debug("Re-invoking planner to get raw response")
                     raw_response = (prompt | llm).invoke(prompt_inputs)
-                    raw_planner_text = getattr(raw_response, "content", str(raw_response)) or ""
-                    sanitized_planner_text = _strip_reasoning_wrappers(raw_planner_text)
-                sanitized_planner_text = _strip_reasoning_wrappers(raw_planner_text)
+                    # Use same robust extraction logic
+                    if hasattr(raw_response, "content"):
+                        raw_planner_text = raw_response.content or ""
+                    elif hasattr(raw_response, "text"):
+                        raw_planner_text = raw_response.text or ""
+                    elif isinstance(raw_response, str):
+                        raw_planner_text = raw_response
+                    else:
+                        raw_planner_text = str(raw_response) if raw_response else ""
+                
+                # Normalize to string (handle bytes) before string operations
+                if raw_planner_text:
+                    if isinstance(raw_planner_text, bytes):
+                        raw_planner_text = raw_planner_text.decode('utf-8', errors='ignore')
+                    elif not isinstance(raw_planner_text, str):
+                        raw_planner_text = str(raw_planner_text)
+                
+                # Filter out error messages
+                if raw_planner_text and ("Invalid json output" in raw_planner_text or "For troubleshooting" in raw_planner_text):
+                    LOGGER.warning("Planner raw response is an error message. This should not happen if we captured it before parsing.")
+                    raw_planner_text = ""  # Clear it
+                
+                sanitized_planner_text = _strip_reasoning_wrappers(raw_planner_text) if raw_planner_text else ""
                 if sanitized_planner_text.strip():
                     if OutputFixingParser is not None:
                         fixing_parser = OutputFixingParser.from_llm(parser=parser, llm=llm)  # type: ignore[call-arg]
@@ -669,82 +1465,105 @@ def _plan_sql(llm: Any):
                     LOGGER.warning("Planner LLM returned empty response after retry. Model may not support this prompt format.")
                     plan = {"sql": "", "plan": {}, "rationale_summary": "", "tests": [], "summary": "", "followups": []}
             except Exception as repair_exc:
-                LOGGER.warning("Planner JSON repair also failed: %s. Raw response: %s", repair_exc, raw_planner_text[:500] if raw_planner_text else "<<empty>>")
+                LOGGER.warning("Planner JSON repair also failed: %s. Raw response length: %d", repair_exc, len(raw_planner_text) if raw_planner_text else 0)
                 plan = {"sql": "", "plan": {}, "rationale_summary": "", "tests": [], "summary": "", "followups": []}
         if isinstance(plan, dict):
             sql_statements = plan.get("sql")
+            
+            # Normalize SQL: handle arrays, null, wrong types, etc.
+            if sql_statements is not None:
+                # Handle array format: ["SELECT ..."] or ["SQL1", "SQL2"] or [{"description": "...", "statement": "SQL"}]
+                if isinstance(sql_statements, list):
+                    if len(sql_statements) > 0:
+                        first_elem = sql_statements[0]
+                        # Handle array of strings: ["SELECT ..."]
+                        if isinstance(first_elem, str) and first_elem.strip():
+                            sql_statements = first_elem
+                        # Handle array of objects with statement field: [{"description": "...", "statement": "SQL"}]
+                        elif isinstance(first_elem, dict) and "statement" in first_elem:
+                            statement = first_elem.get("statement", "")
+                            if isinstance(statement, str) and statement.strip():
+                                LOGGER.info("Extracted SQL from object with 'statement' field in array (description: %s)", first_elem.get("description", "N/A"))
+                                sql_statements = statement
+                            else:
+                                LOGGER.warning("Object in SQL array has 'statement' field but it's not a valid string, using robust extraction")
+                                sql_statements = None
+                        else:
+                            LOGGER.warning("SQL array contains non-string/non-object elements (type: %s), using robust extraction", type(first_elem).__name__)
+                            sql_statements = None
+                    else:
+                        sql_statements = None
+                # Handle wrong types: number, object, etc.
+                elif not isinstance(sql_statements, str):
+                    LOGGER.warning("SQL field has wrong type (%s), expected string. Using robust extraction.", type(sql_statements).__name__)
+                    sql_statements = None
+                # Handle empty/whitespace strings
+                elif not sql_statements.strip():
+                    sql_statements = None
+            
+            # If SQL is empty but raw response contains SQL, try to extract it
+            if not sql_statements and raw_planner_text:
+                # Try to extract SQL from raw response using multiple strategies
+                # Strategy 1: Try to extract first JSON object and parse it manually
+                json_obj_text = _extract_first_json_object(sanitized_planner_text if sanitized_planner_text else raw_planner_text)
+                if json_obj_text:
+                    try:
+                        # Try to parse as JSON (might fail if SQL has unescaped quotes)
+                        temp_plan = json.loads(json_obj_text)
+                        if temp_plan.get("sql"):
+                            extracted_sql = temp_plan["sql"]
+                            # Normalize: handle arrays, null, wrong types, objects with statement field
+                            if isinstance(extracted_sql, list) and len(extracted_sql) > 0:
+                                first_elem = extracted_sql[0]
+                                # Handle array of strings: ["SELECT ..."]
+                                if isinstance(first_elem, str):
+                                    extracted_sql = first_elem
+                                # Handle array of objects with statement field: [{"description": "...", "statement": "SQL"}]
+                                elif isinstance(first_elem, dict) and "statement" in first_elem:
+                                    extracted_sql = first_elem.get("statement", "")
+                                    LOGGER.info("Extracted SQL from object with 'statement' field in fallback extraction")
+                                else:
+                                    extracted_sql = None
+                            if isinstance(extracted_sql, str) and extracted_sql.strip():
+                                LOGGER.info("Extracted SQL from JSON object after initial parse failed: %s", extracted_sql[:200])
+                                plan["sql"] = extracted_sql
+                                sql_statements = extracted_sql
+                            else:
+                                LOGGER.debug("Extracted SQL from JSON object is invalid (type: %s, empty: %s)", 
+                                           type(extracted_sql).__name__, not extracted_sql if isinstance(extracted_sql, str) else True)
+                    except Exception as json_exc:
+                        LOGGER.debug("Failed to parse extracted JSON object: %s", json_exc)
+                
+                # Strategy 2: Use robust extraction to find SQL field (handles malformed JSON)
+                if not sql_statements:
+                    extracted_sql = _extract_sql_from_malformed_json(raw_planner_text)
+                    if extracted_sql:
+                        LOGGER.info("Extracted SQL from raw response using robust parser: %s", extracted_sql[:200])
+                        plan["sql"] = extracted_sql
+                        sql_statements = extracted_sql
             if not sql_statements:
                 # Log raw response for debugging when SQL is empty
                 if raw_planner_text:
                     LOGGER.info("Planner returned empty SQL. Raw LLM response: %s", raw_planner_text[:1000])
                 else:
                     LOGGER.warning("Planner returned empty SQL and no raw response was captured. Model may have failed silently.")
-                # Planner failed to produce SQL; bootstrap a minimal SQL using the repair prompt
-                LOGGER.info("Planner returned no SQL. Bootstrapping baseline SQL from Graph Context.")
-                try:
-                    bootstrap_chain = REPAIR_PROMPT | llm | JsonOutputParser()
-                    graph_text = state.get("schema_markdown", "")
-                    result = _safe_invoke_json(
-                        bootstrap_chain,
-                        {
-                            "dialect": state.get("dialect", ""),
-                            "graph": graph_text,
-                            "sql": "",
-                            "error": "Planner produced no SQL; synthesize a minimal, correct SQL answering the question from Graph Context and analysis hints.",
-                            "repair_hints": [
-                                "Use FK paths from RELATIONSHIP_MAP to join necessary tables",
-                                "Select explicit columns, no SELECT *",
-                                "Apply GROUP BY/COUNT and ORDER BY DESC with row cap per dialect",
-                            ],
-                            "plan": {"note": "bootstrap from question and graph"},
-                        },
-                        llm,
-                    )
-                    bootstrap_raw = result.get("__raw", "")
-                    if bootstrap_raw:
-                        LOGGER.debug("Bootstrap raw LLM response: %s", bootstrap_raw[:500])
-                    patched_sql = result.get("patched_sql") or ""
-                    if patched_sql.strip():
-                        plan["sql"] = patched_sql
-                        plan.setdefault("notes", []).append("Bootstrapped baseline SQL due to empty planner output.")
-                        LOGGER.debug("Bootstrapped SQL: %s", patched_sql)
-                    else:
-                        if bootstrap_raw:
-                            LOGGER.warning("Bootstrap returned empty patched_sql. Raw response: %s", bootstrap_raw[:1000])
-                        else:
-                            LOGGER.warning("Bootstrap returned empty patched_sql and no raw response captured.")
-                        
-                        # Try domain fallback as last resort
-                        LOGGER.info("Trying domain-specific fallback SQL generation...")
-                        question = state.get("question", "")
-                        graph_context = state.get("graph_context")
-                        schema = state.get("schema_name")
-                        dialect = state.get("dialect", "")
-                        fallback_sql = maybe_generate_domain_sql(question, graph_context, schema, dialect)
-                        if fallback_sql:
-                            plan["sql"] = fallback_sql[0] if isinstance(fallback_sql, list) else fallback_sql
-                            plan.setdefault("notes", []).append("Used domain-specific fallback SQL due to planner and bootstrap failures.")
-                            LOGGER.info("Domain fallback generated SQL: %s", plan["sql"][:200])
-                        else:
-                            plan["sql_generation_note"] = "Planner returned no SQL and bootstrap produced no patch."
-                            # Surface a clear error for routing to fail node
-                            state["execution_error"] = "Planner failed to produce SQL, bootstrap returned no patch, and domain fallback found no match."
-                except Exception as e:
-                    LOGGER.debug("Bootstrap baseline SQL failed: %s", e)
-                    # Try domain fallback even if bootstrap threw an exception
-                    LOGGER.info("Bootstrap failed with exception. Trying domain-specific fallback SQL generation...")
-                    question = state.get("question", "")
-                    graph_context = state.get("graph_context")
-                    schema = state.get("schema_name")
-                    dialect = state.get("dialect", "")
-                    fallback_sql = maybe_generate_domain_sql(question, graph_context, schema, dialect)
-                    if fallback_sql:
-                        plan["sql"] = fallback_sql[0] if isinstance(fallback_sql, list) else fallback_sql
-                        plan.setdefault("notes", []).append("Used domain-specific fallback SQL due to planner and bootstrap failures.")
-                        LOGGER.info("Domain fallback generated SQL: %s", plan["sql"][:200])
-                    else:
-                        plan["sql_generation_note"] = "Planner returned no SQL and bootstrap failed."
-                        state["execution_error"] = "Planner failed to produce SQL, bootstrap failed, and domain fallback found no match."
+                
+                # Planner failed to produce SQL after all attempts (parsing + robust extraction)
+                # Try domain fallback as last resort (regex-based pattern matching, no LLM call)
+                LOGGER.info("Planner returned no SQL. Trying domain-specific fallback SQL generation (regex pattern matching)...")
+                question = state.get("question", "")
+                graph_context = state.get("graph_context")
+                schema = state.get("schema_name")
+                dialect = state.get("dialect", "")
+                fallback_sql = maybe_generate_domain_sql(question, graph_context, schema, dialect)
+                if fallback_sql:
+                    plan["sql"] = fallback_sql[0] if isinstance(fallback_sql, list) else fallback_sql
+                    plan.setdefault("notes", []).append("Used domain-specific fallback SQL (regex pattern matching) due to planner failure.")
+                    LOGGER.info("Domain fallback generated SQL: %s", plan["sql"][:200])
+                else:
+                    plan["sql_generation_note"] = "Planner returned no SQL and domain fallback found no matching pattern."
+                    # Surface a clear error for routing to fail node
+                    state["execution_error"] = "Planner failed to produce SQL after all parsing attempts, and domain fallback (regex pattern matching) found no match for the question pattern."
             else:
                 plan = _post_process_plan(plan, state)
             LOGGER.debug("LLM plan: %s", plan)
@@ -777,6 +1596,9 @@ def _intent_critic(llm: Any):
             sql_text = sql or ""
         plan_summary = plan.get("plan") or {}
         graph_text = state.get("schema_markdown", "")
+        desired_columns = state.get("desired_columns") or []
+        desired_columns_raw = state.get("desired_columns_raw") or []
+        query_analysis = state.get("query_analysis") or {}
         result = _safe_invoke_json(
             chain,
             {
@@ -785,6 +1607,8 @@ def _intent_critic(llm: Any):
                 "question": state.get("question", ""),
                 "plan": plan_summary,
                 "sql": sql_text,
+                "desired_columns_section": _format_desired_columns_section(desired_columns, desired_columns_raw),
+                "query_analysis_section": _format_query_analysis_section(query_analysis),
             },
             llm,
         )
@@ -834,7 +1658,11 @@ def _intent_repair(llm: Any):
             sql_text = sql or ""
         critic = state.get("intent_critic") or {}
         error_text = "; ".join(critic.get("reasons", []))
-        graph_text = state.get("schema_markdown", "")
+        # Use rich Graph Context (table cards, column cards, relationships, value anchors)
+        graph_text = _build_rich_graph_context_for_repair(state)
+        desired_columns = state.get("desired_columns") or []
+        desired_columns_raw = state.get("desired_columns_raw") or []
+        query_analysis = state.get("query_analysis") or {}
         result = _safe_invoke_json(
             chain,
             {
@@ -844,19 +1672,67 @@ def _intent_repair(llm: Any):
                 "error": error_text,
                 "repair_hints": critic.get("repair_hints", []),
                 "plan": plan.get("plan") or {},
+                "desired_columns_section": _format_desired_columns_section(desired_columns, desired_columns_raw),
+                "query_analysis_section": _format_query_analysis_section(query_analysis),
             },
             llm,
         )
         LOGGER.info("Intent repair attempt %d result received", attempts + 1)
         patched_sql = result.get("patched_sql")
+        raw_response = result.get("__raw")
+        
+        # Normalize patched_sql: handle arrays, null, wrong types, etc.
+        if patched_sql is not None:
+            # Handle array format: ["SELECT ..."]
+            if isinstance(patched_sql, list):
+                if len(patched_sql) > 0:
+                    first_elem = patched_sql[0]
+                    if isinstance(first_elem, str) and first_elem.strip():
+                        patched_sql = first_elem
+                    else:
+                        LOGGER.warning("patched_sql array contains non-string elements, using robust extraction")
+                        patched_sql = None
+                else:
+                    patched_sql = None
+            # Handle wrong types: number, object, etc.
+            elif not isinstance(patched_sql, str):
+                LOGGER.warning("patched_sql has wrong type (%s), expected string. Using robust extraction.", type(patched_sql).__name__)
+                patched_sql = None
+            # Handle empty/whitespace strings
+            elif not patched_sql.strip():
+                patched_sql = None
+        
+        # If patched_sql is empty but we have raw response, try robust extraction
+        if (not patched_sql or not patched_sql.strip()) and raw_response:
+            # Normalize raw_response to string (handle bytes from any LLM model)
+            if isinstance(raw_response, bytes):
+                raw_response = raw_response.decode('utf-8', errors='ignore')
+            elif not isinstance(raw_response, str):
+                raw_response = str(raw_response)
+            LOGGER.debug("Intent repair returned empty patched_sql, attempting robust extraction from raw response (length: %d)", len(raw_response) if raw_response else 0)
+            extracted_sql = _extract_sql_from_malformed_json(raw_response, field_name="patched_sql")
+            if extracted_sql:
+                LOGGER.info("Extracted patched_sql from raw response using robust parser in intent repair: %s", extracted_sql[:200])
+                patched_sql = extracted_sql
+            else:
+                # Log what we tried to extract from for debugging
+                LOGGER.debug("Robust extraction failed. Raw response preview: %s", raw_response[:500] if raw_response and len(raw_response) > 500 else raw_response)
+        
         if patched_sql and patched_sql.strip() and patched_sql.strip() != sql_text.strip():
             plan["sql"] = patched_sql
             plan.setdefault("notes", []).append(
                 f"Intent repair iteration {attempts + 1} applied."
             )
+            LOGGER.info("Intent repair attempt %d successfully patched SQL", attempts + 1)
             state["plan"] = plan
         else:
-            LOGGER.info("Intent repair attempt %d produced no effective change", attempts + 1)
+            if not patched_sql or not patched_sql.strip():
+                if raw_response:
+                    LOGGER.warning("Intent repair attempt %d returned empty patched_sql. Raw LLM response (first 1000 chars): %s", attempts + 1, raw_response[:1000] if len(raw_response) > 1000 else raw_response)
+                else:
+                    LOGGER.warning("Intent repair attempt %d returned empty patched_sql and no raw response captured", attempts + 1)
+            else:
+                LOGGER.info("Intent repair attempt %d produced no effective change (SQL unchanged)", attempts + 1)
         state["intent_attempts"] = attempts + 1
         state["intent_critic"] = {}
         state.pop("execution_error", None)
@@ -952,6 +1828,22 @@ def _execute_sql(engine: Engine):
             if normalized != sql:
                 sql_statements[idx] = normalized
                 LOGGER.info("Normalized column qualifiers in statement %d based on schema context", idx + 1)
+        
+        # Fix incorrect schema prefixes (e.g., on CTEs, double prefixes, column references)
+        schema_name = state.get("schema_name")
+        if schema_name:
+            for idx, sql in enumerate(sql_statements):
+                # Log before fix for debugging
+                if "AGENT_DEMO.AGENT_DEMO" in sql or f"{schema_name}.{schema_name}" in sql:
+                    LOGGER.debug("Detected multiple schema prefixes in SQL before fix. SQL preview: %s", sql[:300])
+                fixed = _fix_incorrect_schema_prefixes(sql, schema_name)
+                if fixed != sql:
+                    sql_statements[idx] = fixed
+                    LOGGER.info("Fixed incorrect schema prefixes in statement %d. Preview: %s", idx + 1, fixed[:200])
+                else:
+                    # Log if no changes were made but we expected changes
+                    if "AGENT_DEMO.AGENT_DEMO" in sql or f"{schema_name}.{schema_name}" in sql:
+                        LOGGER.warning("Expected to fix schema prefixes but no changes were made. SQL: %s", sql[:300])
 
         for idx, sql in enumerate(sql_statements):
             if isinstance(graph, GraphContext):
@@ -1257,6 +2149,7 @@ def _ensure_schema_qualification(
     """
     Ensure all table references are qualified with the default schema.
     Only applies to tables that are part of the known graph context.
+    Skips CTEs and already-qualified tables.
     """
     if not schema_name:
         return sql_text, False
@@ -1265,30 +2158,220 @@ def _ensure_schema_qualification(
     except Exception:
         return sql_text, False
 
+    # Collect CTE names (including any that might have incorrect schema prefixes)
     cte_names: Set[str] = set()
     for cte in ast.find_all(exp.CTE):
         alias = getattr(getattr(cte, "alias", None), "name", None)
         name = alias or getattr(getattr(cte, "this", None), "name", None)
         if name:
-            cte_names.add(name.lower())
+            # Normalize: remove schema prefix if present (CTEs shouldn't have them)
+            normalized_name = name.lower()
+            if "." in normalized_name:
+                # Extract just the CTE name (last part after dots)
+                normalized_name = normalized_name.split(".")[-1]
+            cte_names.add(normalized_name)
 
     changed = False
     for table in ast.find_all(exp.Table):
+        # Skip if already has schema qualification
         if table.args.get("db"):
+            # Check if it's a double-qualification (schema.schema.table) and fix it
+            existing_db = str(table.args.get("db", "")).lower()
+            if existing_db == schema_name.lower():
+                # Already correctly qualified, skip
+                continue
+            # If it has a different schema, leave it alone
             continue
+        
         identifier = getattr(table, "this", None)
         if not isinstance(identifier, exp.Identifier):
             continue
         table_name = (identifier.name or "").lower()
         if not table_name:
             continue
+        
+        # Skip if this is a CTE (check both full name and base name)
         if table_name in cte_names:
             continue
+        # Also check if table_name is the base part of any CTE
+        if any(cte_name.endswith(f".{table_name}") or cte_name == table_name for cte_name in cte_names):
+            continue
+        
+        # Only qualify if it's a known table
         if known_tables and table_name not in known_tables:
             continue
+        
         table.set("db", exp.to_identifier(schema_name))
         changed = True
+    
+    # Also fix CTEs that incorrectly have schema prefixes
+    for cte in ast.find_all(exp.CTE):
+        alias = getattr(cte, "alias", None)
+        if alias and hasattr(alias, "name"):
+            cte_name = alias.name
+            # If CTE name has schema prefix, remove it
+            if "." in cte_name and not cte_name.startswith("("):
+                # Extract just the CTE name
+                parts = cte_name.split(".")
+                # If it looks like schema.schema.cte_name or schema.cte_name, use last part
+                if len(parts) > 1:
+                    # Check if first part matches schema (likely incorrect qualification)
+                    if parts[0].upper() == schema_name.upper():
+                        alias.name = parts[-1]  # Use just the CTE name
+                        changed = True
+    
     return (ast.sql() if changed else sql_text), changed
+
+
+def _fix_incorrect_schema_prefixes(sql_text: str, schema_name: str) -> str:
+    """
+    Fix common schema qualification errors:
+    - Remove schema prefixes from CTE names (e.g., AGENT_DEMO.recent_test_sets -> recent_test_sets)
+    - Fix double/triple schema prefixes (e.g., AGENT_DEMO.AGENT_DEMO.table -> AGENT_DEMO.table)
+    - Fix schema prefixes on column references (e.g., e.AGENT_DEMO.run_at -> e.run_at)
+    - Fix CTE references in FROM/JOIN clauses that have schema prefixes
+    
+    Uses regex preprocessing to fix CTE names before sqlglot parsing, then uses sqlglot
+    for more precise fixes on table and column references.
+    """
+    if not schema_name:
+        return sql_text
+    
+    import re
+    
+    # STEP 1: Regex preprocessing to fix CTE names with schema prefixes BEFORE parsing
+    # This handles cases where sqlglot might not parse malformed CTE names correctly
+    # Pattern: WITH schema.schema.schema.cte_name AS or WITH schema.cte_name AS
+    # Match: WITH followed by one or more schema. prefixes, then CTE name, then AS
+    # IMPORTANT: Match ALL CTEs in the WITH clause, not just the first one
+    # Pattern matches: WITH schema.cte1 AS ..., schema.cte2 AS ... (handles comma-separated CTEs)
+    # Use \s* to handle optional whitespace/newlines
+    cte_pattern = rf'\b((?:WITH|,)\s*)((?:{re.escape(schema_name)}\.)+)(\w+)\s+AS\b'
+    
+    def fix_cte_name(match):
+        prefix = match.group(1)  # "WITH " or ", "
+        schema_prefix = match.group(2)  # e.g., "AGENT_DEMO.AGENT_DEMO.AGENT_DEMO."
+        cte_name = match.group(3)  # e.g., "monthly_stats"
+        # Preserve whitespace in prefix
+        return f'{prefix}{cte_name} AS'
+    
+    sql_text = re.sub(cte_pattern, fix_cte_name, sql_text, flags=re.IGNORECASE | re.MULTILINE)
+    
+    # Also fix CTE references in FROM/JOIN clauses (but only if they're not actual tables)
+    # We'll collect CTE names first, then fix references
+    cte_names_set = set()
+    # Extract CTE names from WITH clauses (after our fix above)
+    # Match both: WITH cte1 AS ... and , cte2 AS ... (handles comma-separated CTEs)
+    cte_def_pattern = r'\b(?:WITH|,)\s+(\w+)\s+AS\b'
+    for match in re.finditer(cte_def_pattern, sql_text, re.IGNORECASE):
+        cte_names_set.add(match.group(1).lower())
+    
+    # Fix CTE references with schema prefixes in table contexts (FROM/JOIN/UPDATE/DELETE)
+    # Pattern: FROM schema.schema.cte_name or JOIN schema.cte_name (where cte_name is a known CTE)
+    # Also fix in subqueries: (SELECT ... FROM schema.cte_name)
+    for cte_name in cte_names_set:
+        # Match schema prefix(es) followed by the CTE name in FROM/JOIN contexts
+        # Use word boundaries to avoid partial matches
+        cte_ref_pattern = rf'\b((?:FROM|JOIN|UPDATE|DELETE\s+FROM)\s+)((?:{re.escape(schema_name)}\.)+){re.escape(cte_name)}\b'
+        def fix_cte_ref(match):
+            keyword = match.group(1).strip()  # "FROM", "JOIN", etc.
+            return f'{keyword} {cte_name}'
+        sql_text = re.sub(cte_ref_pattern, fix_cte_ref, sql_text, flags=re.IGNORECASE)
+        
+        # Also fix CTE references in subqueries and other table contexts
+        # Pattern: schema.schema.cte_name when used as a table (after FROM, JOIN, or in subqueries)
+        # Be more specific: only replace if it's followed by AS (alias) or whitespace/comma/end
+        cte_ref_table_pattern = rf'\b((?:{re.escape(schema_name)}\.)+){re.escape(cte_name)}(?=\s+(?:AS\s+\w+|\w+|,|\)|$))'
+        sql_text = re.sub(cte_ref_table_pattern, cte_name, sql_text, flags=re.IGNORECASE)
+    
+    # Fix multiple schema prefixes on actual tables: schema.schema.schema.table -> schema.table
+    # Pattern: schema.schema.table (where schema repeats)
+    table_pattern = rf'\b({re.escape(schema_name)}\.)+({re.escape(schema_name)}\.)+(\w+)\b'
+    sql_text = re.sub(table_pattern, rf'{schema_name}.\3', sql_text, flags=re.IGNORECASE)
+    
+    # STEP 2: Use sqlglot for more precise fixes on column references and edge cases
+    try:
+        ast = parse_one(sql_text, read=None)
+        changed = False
+        
+        # Collect CTE names from the AST (after regex preprocessing)
+        cte_names: Set[str] = set()
+        for cte in ast.find_all(exp.CTE):
+            alias = getattr(cte, "alias", None)
+            if alias and hasattr(alias, "name"):
+                cte_name = alias.name
+                # Double-check: remove any remaining schema prefixes
+                if "." in cte_name:
+                    parts = cte_name.split(".")
+                    if parts[0].upper() == schema_name.upper():
+                        alias.name = parts[-1]
+                        changed = True
+                        cte_name = alias.name
+                cte_names.add(cte_name.lower())
+        
+        # Fix table references that are CTEs (in FROM/JOIN clauses)
+        for table in ast.find_all(exp.Table):
+            identifier = getattr(table, "this", None)
+            if not isinstance(identifier, exp.Identifier):
+                continue
+            
+            table_name = identifier.name
+            if not table_name:
+                continue
+            
+            # Check if this is a CTE reference with schema prefix
+            if "." in table_name:
+                parts = table_name.split(".")
+                if len(parts) > 1 and parts[-1].lower() in cte_names:
+                    identifier.name = parts[-1]
+                    if hasattr(table, "db"):
+                        table.set("db", None)
+                    changed = True
+                    continue
+            
+            # Fix multiple schema prefixes on actual tables
+            if "." in table_name:
+                parts = table_name.split(".")
+                if len(parts) > 2 and parts[0].upper() == schema_name.upper():
+                    # Remove duplicate schema prefixes
+                    cleaned_parts = [parts[0]]
+                    i = 1
+                    while i < len(parts) - 1:
+                        if parts[i].upper() != schema_name.upper():
+                            cleaned_parts.append(parts[i])
+                        i += 1
+                    cleaned_parts.append(parts[-1])
+                    identifier.name = ".".join(cleaned_parts)
+                    changed = True
+                elif len(parts) == 2 and parts[0].upper() == schema_name.upper() and parts[1].lower() in cte_names:
+                    # This is a CTE with schema prefix
+                    identifier.name = parts[1]
+                    if hasattr(table, "db"):
+                        table.set("db", None)
+                    changed = True
+        
+        # Fix column references with schema prefixes (e.g., e.AGENT_DEMO.run_at -> e.run_at)
+        for column in ast.find_all(exp.Column):
+            table = getattr(column, "table", None)
+            if table:
+                table_str = table if isinstance(table, str) else (getattr(table, "name", None) if hasattr(table, "name") else str(table))
+                if table_str and isinstance(table_str, str):
+                    if "." in table_str:
+                        parts = table_str.split(".")
+                        # Check if it's a CTE reference with schema prefix
+                        if len(parts) > 1 and parts[-1].lower() in cte_names:
+                            column.set("table", parts[-1])
+                            changed = True
+                        elif len(parts) > 1 and parts[-1].upper() == schema_name.upper():
+                            # Remove schema part from column reference: e.AGENT_DEMO -> e
+                            column.set("table", parts[0])
+                            changed = True
+        
+        return ast.sql() if changed else sql_text
+    except Exception as e:
+        # If sqlglot parsing fails, return the regex-preprocessed SQL
+        LOGGER.debug("sqlglot parsing failed in _fix_incorrect_schema_prefixes, using regex-only fix: %s", e)
+        return sql_text
 
 
 def _metadata_fallback(state: QueryState) -> Optional[List[str]]:
@@ -1405,14 +2488,20 @@ def _critic_sql(llm: Any):
             "notes": plan.get("plan", {}).get("notes", []),
         }
         graph_text = state.get("schema_markdown", "")
+        desired_columns = state.get("desired_columns") or []
+        desired_columns_raw = state.get("desired_columns_raw") or []
+        query_analysis = state.get("query_analysis") or {}
         result = _safe_invoke_json(
             chain,
             {
                 "dialect": state.get("dialect", ""),
                 "graph": graph_text,
+                "question": state.get("question", ""),
                 "sql": sql_text,
                 "plan": plan_summary,
                 "error": state.get("execution_error", ""),
+                "desired_columns_section": _format_desired_columns_section(desired_columns, desired_columns_raw),
+                "query_analysis_section": _format_query_analysis_section(query_analysis),
             },
             llm,
         )
@@ -1444,30 +2533,74 @@ def _repair_sql(llm: Any):
             sql_text = sql or ""
         critic = state.get("critic") or {}
         attempts = state.get("repair_attempts", 0)
+        # Use rich Graph Context (table cards, column cards, relationships, value anchors)
+        graph_text = _build_rich_graph_context_for_repair(state)
+        desired_columns = state.get("desired_columns") or []
+        desired_columns_raw = state.get("desired_columns_raw") or []
+        query_analysis = state.get("query_analysis") or {}
         result = _safe_invoke_json(
             chain,
             {
                 "dialect": state.get("dialect", ""),
-                "graph": state.get("schema_markdown", ""),
+                "graph": graph_text,
                 "sql": sql_text,
                 "error": state.get("execution_error", ""),
                 "repair_hints": critic.get("repair_hints", []),
                 "plan": plan,
+                "desired_columns_section": _format_desired_columns_section(desired_columns, desired_columns_raw),
+                "query_analysis_section": _format_query_analysis_section(query_analysis),
             },
             llm,
         )
         LOGGER.info("Post-exec repair attempt %d/%d (MAX) result received", attempts + 1, MAX_INTENT_REPAIRS)
         patched_sql = result.get("patched_sql")
+        raw_response = result.get("__raw")
         what_changed = result.get("what_changed")
         why_changed = result.get("why")
         if what_changed:
             LOGGER.info("Post-exec repair what_changed: %s", what_changed)
         if why_changed:
             LOGGER.info("Post-exec repair why: %s", why_changed)
-        if not patched_sql:
-            raw = result.get("__raw")
-            if raw:
-                LOGGER.info("Post-exec repair returned no patched_sql. Raw response: %s", raw)
+        
+        # Normalize patched_sql: handle arrays, null, wrong types, etc.
+        if patched_sql is not None:
+            # Handle array format: ["SELECT ..."]
+            if isinstance(patched_sql, list):
+                if len(patched_sql) > 0:
+                    first_elem = patched_sql[0]
+                    if isinstance(first_elem, str) and first_elem.strip():
+                        patched_sql = first_elem
+                    else:
+                        LOGGER.warning("patched_sql array contains non-string elements, using robust extraction")
+                        patched_sql = None
+                else:
+                    patched_sql = None
+            # Handle wrong types: number, object, etc.
+            elif not isinstance(patched_sql, str):
+                LOGGER.warning("patched_sql has wrong type (%s), expected string. Using robust extraction.", type(patched_sql).__name__)
+                patched_sql = None
+            # Handle empty/whitespace strings
+            elif not patched_sql.strip():
+                patched_sql = None
+        
+        # If patched_sql is empty but we have raw response, try robust extraction
+        if (not patched_sql or not patched_sql.strip()) and raw_response:
+            # Normalize raw_response to string (handle bytes from any LLM model)
+            if isinstance(raw_response, bytes):
+                raw_response = raw_response.decode('utf-8', errors='ignore')
+            elif not isinstance(raw_response, str):
+                raw_response = str(raw_response)
+            LOGGER.debug("Post-exec repair returned empty patched_sql, attempting robust extraction from raw response (length: %d)", len(raw_response) if raw_response else 0)
+            extracted_sql = _extract_sql_from_malformed_json(raw_response, field_name="patched_sql")
+            if extracted_sql:
+                LOGGER.info("Extracted patched_sql from raw response using robust parser in post-exec repair: %s", extracted_sql[:200])
+                patched_sql = extracted_sql
+            else:
+                # Log what we tried to extract from for debugging
+                LOGGER.debug("Robust extraction failed. Raw response preview: %s", raw_response[:500] if raw_response and len(raw_response) > 500 else raw_response)
+        
+        if not patched_sql and raw_response:
+            LOGGER.warning("Post-exec repair returned no patched_sql. Raw response (first 1000 chars): %s", raw_response[:1000] if len(raw_response) > 1000 else raw_response)
         if patched_sql:
             plan["sql"] = patched_sql
             plan.setdefault("notes", []).append(
