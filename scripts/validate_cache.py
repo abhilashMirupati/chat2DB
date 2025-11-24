@@ -286,8 +286,8 @@ def main() -> None:
     except Exception as exc:  # noqa: BLE001
         LOGGER.error("  ✗ Failed to read vector store: %s", exc)
         LOGGER.error("  Vector store may not be initialised. Run prewarm_metadata.py to generate embeddings.")
-            sys.exit(1)
-        
+        sys.exit(1)
+    
     total_vectors = sum(len(ids) for ids in actual_vector_map.values())
     LOGGER.info("  Found %s embedding(s) in vector store", total_vectors)
 
@@ -343,8 +343,8 @@ def main() -> None:
                     tables_to_fix,
                     graph_cache,
                     embedder,
-                    )
-            
+                )
+                
                 LOGGER.info("  ✓ Successfully generated embeddings for %s table(s)", len(tables_to_fix))
                 
                 # Re-check to verify fix
@@ -366,13 +366,13 @@ def main() -> None:
                 LOGGER.error("  ✗ Failed to generate embeddings: %s", exc)
                 LOGGER.error("  Please check your embedding provider configuration and try again.")
                 sys.exit(1)
-        else:
-            # Only log success if we actually had cards to check
-            if expected_vector_map:
+    else:
+        # Only log success if we actually had cards to check
+        if expected_vector_map:
             LOGGER.info("  ✓ All graph cards have embeddings")
-            elif db_table_names:
-                # DB has tables but no graph cards in cache
-                LOGGER.warning("  ⚠ No graph cards in cache to validate embeddings for")
+        elif db_table_names:
+            # DB has tables but no graph cards in cache
+            LOGGER.warning("  ⚠ No graph cards in cache to validate embeddings for")
 
     if orphaned_embeddings_map:
         LOGGER.warning(

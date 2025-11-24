@@ -1423,16 +1423,67 @@ def main() -> None:
             from sqlai.services.graph_cache import GraphCache
             from sqlai.services.metadata_cache import MetadataCache
             from sqlai.database.schema_introspector import TableSummary, ColumnMetadata, ForeignKeyDetail
+            from sqlai.database.connectors import create_db_engine
             import json
             
-            # Use the schema from db_config (which comes from session state) to ensure consistency
-            schema_to_check = (db_config.schema or "(default)") if db_config else "(default)"
-            LOGGER.info("Rendering schema from cache for schema: '%s'", schema_to_check)
+            # Calculate schema key EXACTLY the same way AnalyticsService._schema_key() does
+            # This ensures cache lookup uses the same key that AnalyticsService uses for storage
+            # Priority 1: Use db_config.schema if set (even if empty string - user selected "(current schema)")
+            schema_to_check = None
+            if db_config.schema is not None:
+                schema_value = str(db_config.schema).strip()
+                if schema_value:
+                    schema_to_check = schema_value
+                    LOGGER.info(
+                        "Using user-selected schema from db_config for cache lookup: '%s'",
+                        schema_to_check,
+                    )
+                else:
+                    # Empty string means user selected "(current schema)" - need to get default from engine
+                    LOGGER.info(
+                        "db_config.schema is empty string (user selected '(current schema)'), will get default from engine"
+                    )
+            
+            # Priority 2: If schema not set or empty, get default from engine (same as AnalyticsService)
+            if not schema_to_check:
+                try:
+                    # Create temporary engine to get default schema (same logic as AnalyticsService._schema_key())
+                    temp_engine = create_db_engine(db_config)
+                    default_schema = getattr(temp_engine.dialect, "default_schema_name", None)
+                    if isinstance(default_schema, str):
+                        schema_to_check = default_schema
+                        LOGGER.info("Using default schema from engine dialect: '%s'", schema_to_check)
+                    elif callable(default_schema):
+                        try:
+                            schema_to_check = default_schema(temp_engine)
+                            LOGGER.info("Using default schema from engine callable: '%s'", schema_to_check)
+                        except TypeError:
+                            schema_to_check = default_schema()
+                            LOGGER.info("Using default schema from engine callable (no args): '%s'", schema_to_check)
+                    temp_engine.dispose(close=True)
+                except Exception as engine_exc:
+                    LOGGER.debug("Could not get default schema from engine: %s", engine_exc)
+            
+            # Fallback to "(default)" if still no schema (matches AnalyticsService behavior)
+            schema_to_check = schema_to_check or "(default)"
+            LOGGER.info(
+                "Cache lookup will use schema key: '%s' (db_config.schema='%s', matches AnalyticsService._schema_key() logic)",
+                schema_to_check,
+                db_config.schema if db_config.schema is not None else "(None)",
+            )
+            
             app_config = load_app_config()
             metadata_cache = MetadataCache(app_config.cache_dir / "table_metadata.db")
             graph_cache = GraphCache(app_config.cache_dir / "graph_cards.db")
             metadata_tables = metadata_table_names(metadata_cache, schema_to_check)
             graph_tables = set(graph_cache.list_tables(schema_to_check))
+            
+            LOGGER.info(
+                "Cache lookup results for schema '%s': %s metadata tables, %s graph tables",
+                schema_to_check,
+                len(metadata_tables),
+                len(graph_tables),
+            )
             
             if metadata_tables or graph_tables:
                 # We have cache - try to render schema
