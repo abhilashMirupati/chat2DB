@@ -99,6 +99,7 @@ class AnalyticsService:
         self.conversation_cache = ConversationCache(self.app_config.cache_dir / "conversation_history.db")
         self.table_hashes: Dict[str, str] = {}
         self._schema_cache_key: Optional[str] = None  # Cache schema key to avoid recalculation
+        self.schema_summaries: List[TableSummary] = []  # Initialize early to avoid AttributeError
 
         self.engine = create_db_engine(self.db_config)
         connectivity_error = test_connection(self.engine)
@@ -170,21 +171,56 @@ class AnalyticsService:
             # NOTE: This loads schema from cache, not live database. If DB schema changed,
             # user must re-run prewarm_metadata.py to refresh cache.
             if len(metadata_tables) > 0 and len(graph_tables) > 0:
-                LOGGER.info(
-                    "Cache detected (%s metadata tables, %s graph tables). "
-                    "Assuming cache is pre-validated - loading schema from cache (not live DB). "
-                    "If database schema changed, re-run prewarm_metadata.py to refresh.",
-                    len(metadata_tables),
-                    len(graph_tables),
-            )
-                # Fast path: Reconstruct schema summaries from cache (no DB introspection)
-                # This means UI shows cached schema info, not current DB state
-                self.schema_summaries = self._load_schema_summaries_from_cache(schema_cache_key)
-                LOGGER.info("Loaded %s tables from cache (no DB introspection).", len(self.schema_summaries))
-                
-                # Quick hydration - just load from cache, skip LLM calls and sampling
-                self._hydrate_table_metadata_quick()
-                prewarm_complete = True  # Mark as complete for downstream logic
+                # Check if cache might be incomplete by comparing with live DB
+                # If cache has significantly fewer tables than DB, fall back to full introspection
+                try:
+                    db_tables = introspect_database(
+                        self.engine,
+                        schema=self.db_config.schema,
+                        include_system_tables=self.db_config.include_system_tables,
+                    )
+                    db_table_count = len(db_tables)
+                    cache_table_count = len(metadata_tables)
+                    
+                    # If cache has less than 50% of DB tables, consider it incomplete
+                    if db_table_count > 0 and cache_table_count < (db_table_count * 0.5):
+                        LOGGER.warning(
+                            "Cache appears incomplete: %s tables in cache vs %s tables in database. "
+                            "Falling back to full introspection. Run 'python scripts/prewarm_metadata.py' to refresh cache.",
+                            cache_table_count,
+                            db_table_count,
+                        )
+                        # Fall through to full introspection
+                        self.schema_summaries = db_tables
+                        LOGGER.info("Loaded %s tables from database introspection.", len(self.schema_summaries))
+                        self._hydrate_table_metadata()
+                        prewarm_complete = False  # Mark as incomplete to trigger full sync
+                    else:
+                        LOGGER.info(
+                            "Cache detected (%s metadata tables, %s graph tables). "
+                            "Assuming cache is pre-validated - loading schema from cache (not live DB). "
+                            "If database schema changed, re-run prewarm_metadata.py to refresh.",
+                            len(metadata_tables),
+                            len(graph_tables),
+                        )
+                        # Fast path: Reconstruct schema summaries from cache (no DB introspection)
+                        # This means UI shows cached schema info, not current DB state
+                        self.schema_summaries = self._load_schema_summaries_from_cache(schema_cache_key)
+                        LOGGER.info("Loaded %s tables from cache (no DB introspection).", len(self.schema_summaries))
+                        
+                        # Quick hydration - just load from cache, skip LLM calls and sampling
+                        self._hydrate_table_metadata_quick()
+                        prewarm_complete = True  # Mark as complete for downstream logic
+                except Exception as db_check_exc:
+                    # If we can't check DB, fall back to cache (better than nothing)
+                    LOGGER.warning(
+                        "Could not verify cache completeness against database: %s. Using cache as-is.",
+                        db_check_exc,
+                    )
+                    self.schema_summaries = self._load_schema_summaries_from_cache(schema_cache_key)
+                    LOGGER.info("Loaded %s tables from cache (no DB introspection).", len(self.schema_summaries))
+                    self._hydrate_table_metadata_quick()
+                    prewarm_complete = True
             else:
                 # Cache exists but incomplete - do minimal validation
                 LOGGER.info(
@@ -1715,16 +1751,40 @@ class AnalyticsService:
         return summaries
 
     def _schema_key(self) -> str:
-        if self.db_config.schema:
-            return self.db_config.schema
+        """
+        Get the schema key for cache lookups.
+        Priority:
+        1. Use db_config.schema if explicitly set (user selected schema)
+        2. Try to get default schema from database engine
+        3. Return empty string (will use "(default)" as cache key)
+        """
+        # CRITICAL: Always use db_config.schema if it's set (even if empty string)
+        # This ensures user-selected schema is respected
+        if self.db_config.schema is not None:
+            # Strip whitespace to handle cases where user enters " schema " instead of "schema"
+            schema_value = str(self.db_config.schema).strip()
+            if schema_value:
+                LOGGER.debug("Using schema from db_config: '%s'", schema_value)
+                return schema_value
+            # If schema is explicitly set to empty string, don't fall back to default
+            # This means user wants to use current/default schema
+            LOGGER.debug("db_config.schema is empty string, using default schema from engine")
+        
+        # Only fall back to engine default if schema was not explicitly set
         default_schema = getattr(self.engine.dialect, "default_schema_name", None)
         if isinstance(default_schema, str):
+            LOGGER.debug("Using default schema from engine dialect: '%s'", default_schema)
             return default_schema
         if callable(default_schema):
             try:
-                return default_schema(self.engine)
+                result = default_schema(self.engine)
+                LOGGER.debug("Using default schema from engine callable: '%s'", result)
+                return result
             except TypeError:
-                return default_schema()
+                result = default_schema()
+                LOGGER.debug("Using default schema from engine callable (no args): '%s'", result)
+                return result
+        LOGGER.debug("No schema found, returning empty string (will use '(default)' as cache key)")
         return ""
 
     def _is_prewarm_complete(self, schema_cache_key: Optional[str] = None) -> bool:

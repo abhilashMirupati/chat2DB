@@ -1277,7 +1277,15 @@ def main() -> None:
     
     # Try to get DB config from session state
     db_url = st.session_state.get("db_url", "")
-    schema = st.session_state.get("db_schema", "")
+    # Get schema from session state - this is the actual selected schema
+    selected_schema = st.session_state.get("db_schema", "")
+    
+    # Log the schema being used for debugging
+    LOGGER.info(
+        "Main function: db_url='%s', selected_schema from session_state='%s'",
+        db_url[:50] + "..." if len(db_url) > 50 else db_url,
+        selected_schema or "(empty/None)",
+    )
     
     # Check if user has actually configured database (not just empty)
     has_configured_db = bool(db_url and db_url.strip())
@@ -1286,15 +1294,21 @@ def main() -> None:
         try:
             db_config = DatabaseConfig(
                 url=db_url,
-                schema=schema or None,
+                schema=selected_schema.strip() if selected_schema else None,  # Use selected_schema, strip whitespace
                 sample_row_limit=st.session_state.get("sample_limit", 100),
                 thick_mode=st.session_state.get("oracle_thick_mode", False),
                 oracle_lib_dir=st.session_state.get("oracle_lib_dir") or None,
                 oracle_config_dir=st.session_state.get("oracle_config_dir") or None,
                 include_system_tables=st.session_state.get("include_system_tables", False),
             )
-        except Exception:  # noqa: BLE001
-            pass
+            # Log what schema was actually set in db_config
+            LOGGER.info(
+                "DatabaseConfig created: db_config.schema='%s'",
+                db_config.schema or "(None/empty)",
+            )
+        except Exception as db_config_exc:  # noqa: BLE001
+            LOGGER.warning("Failed to create DatabaseConfig: %s", db_config_exc)
+            db_config = None
     
     # Check LLM config
     llm_provider = st.session_state.get("llm_provider", "")
@@ -1411,7 +1425,9 @@ def main() -> None:
             from sqlai.database.schema_introspector import TableSummary, ColumnMetadata, ForeignKeyDetail
             import json
             
-            schema_to_check = schema or "(default)"
+            # Use the schema from db_config (which comes from session state) to ensure consistency
+            schema_to_check = (db_config.schema or "(default)") if db_config else "(default)"
+            LOGGER.info("Rendering schema from cache for schema: '%s'", schema_to_check)
             app_config = load_app_config()
             metadata_cache = MetadataCache(app_config.cache_dir / "table_metadata.db")
             graph_cache = GraphCache(app_config.cache_dir / "graph_cards.db")
