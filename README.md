@@ -247,6 +247,35 @@ Rendered cards are cached in `.cache/graph_cards.db` and **only table cards are 
 
 4. **Stage 4: Relationship Retrieval**
    - Gets **ALL relationships** for selected tables (including expanded)
+
+### Table Filtering (Optional)
+
+For large databases (500+ tables), you can optionally filter vector search to specific tables to improve performance and accuracy.
+
+**How it works:**
+- **Vector search filtering**: When tables are selected via the UI filter, vector search only queries embeddings for those tables (faster search)
+- **FK expansion preserved**: Foreign key expansion still uses the full graph context, ensuring join accuracy even if related tables weren't explicitly selected
+- **Optional feature**: If no tables are selected, the system uses all tables (backward compatible)
+
+**When to use:**
+- Databases with 500+ tables where vector search becomes slow
+- Domain-specific queries where you know which tables are relevant (e.g., "Sales Tables", "HR Tables")
+- Improving accuracy by focusing vector search on relevant schema subsets
+
+**UI Features:**
+- Collapsible table filter panel (default collapsed) in main UI
+- Search/filter by table name (partial text matching)
+- Multi-select widget for table selection
+- Group management: Create named groups (e.g., "Sales Tables", "HR Tables") to save and reuse table selections
+- Groups persist in session state across queries
+
+**Example workflow:**
+1. Initialize agent with database connection
+2. Expand "🔍 Filter Tables (Optional)" section
+3. Create a group (e.g., "Sales Tables")
+4. Search and select relevant tables (e.g., `orders`, `customers`, `products`)
+5. Save selection to group
+6. Run queries - vector search will only search selected tables, but FK expansion will still include related tables for accuracy
    - Includes both directions (outgoing and incoming FKs)
    - Ensures complete join paths are available to LLM
 
