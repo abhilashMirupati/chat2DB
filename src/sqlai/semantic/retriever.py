@@ -175,17 +175,17 @@ class SemanticRetriever:
         # Vector store semantic search for tables only (with similarity threshold)
         if self.vector_store and self.provider:
             if table_filter:
-                LOGGER.info("Step 1 - Vector store semantic search for table cards (similarity threshold: 0.75, filtered to %d tables)", len(table_filter))
+                LOGGER.info("Step 1 - Vector store semantic search for table cards (similarity threshold: 0.5, filtered to %d tables)", len(table_filter))
             else:
-                LOGGER.info("Step 1 - Vector store semantic search for table cards (similarity threshold: 0.75)")
+                LOGGER.info("Step 1 - Vector store semantic search for table cards (similarity threshold: 0.5)")
             vector_tables = self._vector_hits(
                 question,
                 graph,
                 max_tables=max_tables,
-                similarity_threshold=0.75,
+                similarity_threshold=0.5,
                 table_filter=table_filter,
             )
-            LOGGER.info("  Found %d tables from vector store (score >= 0.75)", len(vector_tables))
+            LOGGER.info("  Found %d tables from vector store (score >= 0.5)", len(vector_tables))
             for idx, (card, score) in enumerate(vector_tables, 1):
                 LOGGER.info("  %d. %s (vector score: %.4f)", idx, card.name, score)
         else:
@@ -309,7 +309,7 @@ class SemanticRetriever:
         LOGGER.info("Step 6 - Validation checks")
         if not selected_tables:
             LOGGER.error("  ⚠️  CRITICAL: No tables selected! This will cause issues.")
-            LOGGER.error("     Vector tables (score >= 0.75): %d", len(vector_tables))
+            LOGGER.error("     Vector tables (score >= 0.5): %d", len(vector_tables))
             LOGGER.error("     Available tables in graph: %s", 
                         [t.name for t in graph.tables[:10]])
             LOGGER.error("     Run 'python scripts/prewarm_metadata.py' if vector store is empty")
@@ -358,7 +358,7 @@ class SemanticRetriever:
         graph: GraphContext,
         *,
         max_tables: int,
-        similarity_threshold: float = 0.75,
+        similarity_threshold: float = 0.5,
         table_filter: Optional[List[str]] = None,  # Optional list of table names to filter vector search
     ) -> List[Tuple[TableCard, float]]:
         """
@@ -371,12 +371,42 @@ class SemanticRetriever:
             question: User's natural language question
             graph: GraphContext containing all tables
             max_tables: Maximum number of tables to return
-            similarity_threshold: Minimum similarity score (0.0-1.0) to include a table. Default: 0.75
+            similarity_threshold: Minimum similarity score (0.0-1.0) to include a table. Default: 0.5
             table_filter: Optional list of table names to filter vector search. If provided, only these tables will be searched.
         """
         if not self.vector_store or not self.provider:
             LOGGER.debug("Vector store or provider not available, skipping vector search")
             return []
+        
+        # Extract table names mentioned in the question (for exact matching)
+        # Look for patterns like "run table", "the run table", "table run", etc.
+        question_lower = question.lower()
+        mentioned_tables = []
+        for table_card in graph.tables:
+            table_name_lower = table_card.name.lower()
+            # Check if table name appears in question (with word boundaries)
+            # Patterns: "run table", "the run table", "table run", "about run", "run's", etc.
+            patterns = [
+                f" {table_name_lower} ",
+                f" {table_name_lower}'",
+                f" {table_name_lower},",
+                f" {table_name_lower}.",
+                f" {table_name_lower}?",
+                f" {table_name_lower}!",
+                f"the {table_name_lower} ",
+                f"the {table_name_lower}'",
+                f"table {table_name_lower}",
+                f"about {table_name_lower}",
+                f"for {table_name_lower}",
+            ]
+            # Also check if question starts or ends with table name
+            if question_lower.startswith(table_name_lower + " ") or question_lower.endswith(" " + table_name_lower):
+                patterns.append("")  # Will match via startswith/endswith check
+            if any(pattern in question_lower for pattern in patterns) or \
+               question_lower.startswith(table_name_lower + " ") or \
+               question_lower.endswith(" " + table_name_lower):
+                mentioned_tables.append(table_card.name)
+                LOGGER.info("Detected table name '%s' mentioned in question (exact name matching)", table_card.name)
         
         # Filter tables if table_filter is provided
         tables_to_search = graph.tables
@@ -418,9 +448,41 @@ class SemanticRetriever:
             LOGGER.warning("Vector store query failed: %s", exc, exc_info=True)
             return []
         
+        # Extract table names mentioned in the question (for exact matching)
+        # Check ALL tables in graph, not just filtered ones, to catch any mention
+        question_lower = question.lower()
+        mentioned_table_names = set()
+        for table_card in graph.tables:
+            table_name_lower = table_card.name.lower()
+            # Check if table name appears in question (with word boundaries)
+            # Patterns: "run table", "the run table", "table run", "about run", "run's", etc.
+            patterns = [
+                f" {table_name_lower} ",
+                f" {table_name_lower}'",
+                f" {table_name_lower},",
+                f" {table_name_lower}.",
+                f" {table_name_lower}?",
+                f" {table_name_lower}!",
+                f"the {table_name_lower} ",
+                f"the {table_name_lower}'",
+                f"table {table_name_lower}",
+                f"about {table_name_lower}",
+                f"for {table_name_lower}",
+            ]
+            # Also check if question starts or ends with table name
+            if any(pattern in question_lower for pattern in patterns) or \
+               question_lower.startswith(table_name_lower + " ") or \
+               question_lower.endswith(" " + table_name_lower):
+                mentioned_table_names.add(table_card.name.lower())
+                LOGGER.info("Detected table name '%s' mentioned in question (will bypass similarity threshold)", table_card.name)
+        
         matched_count = 0
         filtered_count = 0
         unmatched_tables = []
+        # Build set of filtered table names (case-insensitive) for threshold bypass
+        # This allows user-selected tables to bypass similarity threshold
+        filter_set_lower = {t.lower() for t in table_filter} if table_filter else set()
+        
         for hit in table_results:
             metadata = hit.get("metadata") or {}
             score = float(hit.get("score", 0.0))
@@ -429,11 +491,19 @@ class SemanticRetriever:
                 LOGGER.warning("Vector store hit missing 'table' in metadata: %s", metadata)
                 continue
             
-            # Apply similarity threshold filter
-            if score < similarity_threshold:
+            # Apply similarity threshold filter, BUT bypass threshold for:
+            # 1. Explicitly filtered tables (user selected in UI)
+            # 2. Tables mentioned in the question (exact name matching)
+            is_in_user_filter = table_name.lower() in filter_set_lower
+            is_mentioned_in_question = table_name.lower() in mentioned_table_names
+            if score < similarity_threshold and not is_in_user_filter and not is_mentioned_in_question:
                 filtered_count += 1
                 LOGGER.debug("Filtered out table '%s' (score %.4f < threshold %.2f)", table_name, score, similarity_threshold)
                 continue
+            elif score < similarity_threshold and (is_in_user_filter or is_mentioned_in_question):
+                reason = "user's filter" if is_in_user_filter else "mentioned in question"
+                LOGGER.info("Including table '%s' despite low score (%.4f < %.2f) because it's in %s", 
+                           table_name, score, similarity_threshold, reason)
             
             # Try exact match first, then case-insensitive
             card = table_map_original.get(table_name) or table_map.get(table_name.lower())
@@ -448,6 +518,46 @@ class SemanticRetriever:
         if unmatched_tables:
             LOGGER.warning("Vector store returned %d table(s) not found in graph: %s", 
                           len(unmatched_tables), unmatched_tables[:5])
+        
+        # Ensure all relevant tables are included:
+        # 1. Tables in user's filter (even if not in vector results)
+        # 2. Tables mentioned in question (even if not in vector results or below threshold)
+        included_table_names = {card.name.lower() for card, _ in table_hits}
+        missing_tables = []
+        
+        # Build full graph lookup for mentioned tables (not just filtered tables)
+        full_graph_table_map = {card.name.lower(): card for card in graph.tables}
+        full_graph_table_map_original = {card.name: card for card in graph.tables}
+        
+        # Add tables from filter if not already included
+        if table_filter:
+            for table_name in table_filter:
+                if table_name.lower() not in included_table_names:
+                    # Find the table card from graph (try filtered map first, then full graph)
+                    card = table_map_original.get(table_name) or table_map.get(table_name.lower()) or \
+                           full_graph_table_map_original.get(table_name) or full_graph_table_map.get(table_name.lower())
+                    if card:
+                        # Add with a default low score (0.5) since it wasn't in vector results
+                        table_hits.append((card, 0.5))
+                        missing_tables.append(table_name)
+                        included_table_names.add(table_name.lower())
+                        LOGGER.info("Added table '%s' from filter (not found in vector results, using default score 0.5)", table_name)
+        
+        # Add tables mentioned in question if not already included
+        for mentioned_table_lower in mentioned_table_names:
+            if mentioned_table_lower not in included_table_names:
+                # Find the table card from full graph (mentioned tables might not be in filtered search)
+                card = full_graph_table_map_original.get(mentioned_table_lower) or full_graph_table_map.get(mentioned_table_lower)
+                if card:
+                    # Add with a default score (0.6) since it was mentioned in question
+                    table_hits.append((card, 0.6))
+                    missing_tables.append(card.name)
+                    included_table_names.add(mentioned_table_lower)
+                    LOGGER.info("Added table '%s' mentioned in question (not found in vector results or below threshold, using default score 0.6)", card.name)
+        
+        if missing_tables:
+            LOGGER.info("Added %d table(s) that weren't in vector results: %s", 
+                       len(missing_tables), missing_tables)
         
         # Sort by score (descending) and limit to max_tables
         table_hits.sort(key=lambda item: item[1], reverse=True)

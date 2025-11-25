@@ -1208,6 +1208,25 @@ class AnalyticsService:
                 metadata["row_estimate"] = table_card.row_estimate
             if table_card.comment:
                 metadata["comment"] = table_card.comment
+            
+            # Get table description from metadata cache to include in embedding text
+            # This improves semantic search accuracy (e.g., "what is the run table about")
+            table_text = table_card.render()
+            try:
+                # Normalize schema key for cache lookup (matches cache storage normalization)
+                schema_key_normalized = schema.lower() if schema and schema != "(default)" else schema
+                cached_meta = self.metadata_cache.fetch(schema_key_normalized, table_name)
+                if cached_meta and cached_meta.get("description"):
+                    description = cached_meta.get("description")
+                    # Prepend description to table text for better embedding matching
+                    # Format: description + table card details
+                    table_text = f"{description}\n{table_text}"
+                    metadata["description"] = description
+                    LOGGER.debug("Included table description in embedding text for '%s'", table_name)
+            except Exception as exc:  # noqa: BLE001
+                LOGGER.debug("Could not fetch description for table '%s' from cache: %s", table_name, exc)
+                # Continue without description if cache lookup fails
+            
             records.append(
                 GraphCardRecord(
                     schema=schema,
@@ -1215,7 +1234,7 @@ class AnalyticsService:
                     card_type="table",
                     identifier="__table__",
                     schema_hash=schema_hash,
-                    text=table_card.render(),
+                    text=table_text,  # Now includes description if available
                     metadata=metadata,
                 )
             )

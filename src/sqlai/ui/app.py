@@ -1322,22 +1322,6 @@ def render_table_filter(service: AnalyticsService) -> None:
                 st.session_state["selected_tables_for_query"] = groups[selected_group_option].copy()
                 st.rerun()
         
-        # Group actions (only if group is selected)
-        if active_group and active_group in groups:
-            col1, col2 = st.columns(2)
-            with col1:
-                if st.button("💾 Save Current Selection to Group", type="secondary"):
-                    groups[active_group] = selected_tables.copy()
-                    st.session_state["table_filter_groups"] = groups
-                    st.success(f"Saved {len(selected_tables)} tables to group '{active_group}'")
-            with col2:
-                if st.button("🗑️ Delete Group", type="secondary"):
-                    del groups[active_group]
-                    st.session_state["table_filter_groups"] = groups
-                    if st.session_state["active_table_filter_group"] == active_group:
-                        st.session_state["active_table_filter_group"] = None
-                    st.rerun()
-        
         st.divider()
         
         # Table Selection Section
@@ -1367,6 +1351,23 @@ def render_table_filter(service: AnalyticsService) -> None:
         
         # Update session state
         st.session_state["selected_tables_for_query"] = selected_tables_new
+        
+        # Group actions (only if group is selected) - moved AFTER multiselect so we use current selection
+        if active_group and active_group in groups:
+            col1, col2 = st.columns(2)
+            with col1:
+                if st.button("💾 Save Current Selection to Group", type="secondary"):
+                    # Use selected_tables_new (current multiselect value) instead of selected_tables (old value)
+                    groups[active_group] = selected_tables_new.copy()
+                    st.session_state["table_filter_groups"] = groups
+                    st.success(f"Saved {len(selected_tables_new)} tables to group '{active_group}'")
+            with col2:
+                if st.button("🗑️ Delete Group", type="secondary"):
+                    del groups[active_group]
+                    st.session_state["table_filter_groups"] = groups
+                    if st.session_state["active_table_filter_group"] == active_group:
+                        st.session_state["active_table_filter_group"] = None
+                    st.rerun()
         
         # Display selection info
         if selected_tables_new:

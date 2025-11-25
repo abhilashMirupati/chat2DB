@@ -1567,6 +1567,11 @@ def _plan_sql(llm: Any):
             else:
                 plan = _post_process_plan(plan, state)
             LOGGER.debug("LLM plan: %s", plan)
+            # Log the SQL that planner is storing in state["plan"]
+            final_sql = plan.get("sql")
+            LOGGER.info("Planner storing SQL in state['plan']['sql']: %s", 
+                       (final_sql[:500] if isinstance(final_sql, str) else str(final_sql)[:500]) if final_sql else "(empty)")
+            LOGGER.debug("Planner plan object keys: %s", list(plan.keys()) if plan else "plan is empty")
         return {
             "plan": plan,
             "prompt_inputs": prompt_inputs,
@@ -1594,6 +1599,14 @@ def _intent_critic(llm: Any):
             sql_text = "\n".join(sql)
         else:
             sql_text = sql or ""
+        
+        # Log the SQL that intent critic is receiving (for debugging)
+        LOGGER.info("Intent critic receiving SQL from plan.get('sql'): %s", sql_text[:500] if sql_text else "(empty)")
+        LOGGER.debug("Intent critic plan object keys: %s", list(plan.keys()) if plan else "plan is empty")
+        LOGGER.debug("Intent critic plan.get('sql') type: %s, value preview: %s", 
+                    type(sql).__name__, 
+                    (sql[:200] if isinstance(sql, str) else str(sql)[:200]) if sql else "None")
+        
         plan_summary = plan.get("plan") or {}
         graph_text = state.get("schema_markdown", "")
         desired_columns = state.get("desired_columns") or []
@@ -2059,7 +2072,10 @@ def _post_process_plan(plan: Dict[str, Any], state: QueryState) -> Dict[str, Any
     for sql in sql_list:
         sql_text = sql
         lower_sql = sql.lower()
-        if schema_upper and "user_tables" in lower_sql and "all_tables" not in lower_sql:
+        # Only replace USER_TABLES with ALL_TABLES for table listing queries, NOT for COUNT queries
+        # Check if this is a COUNT query - if so, don't replace it
+        is_count_query = "count(*)" in lower_sql or "count (" in lower_sql
+        if schema_upper and "user_tables" in lower_sql and "all_tables" not in lower_sql and not is_count_query:
             sql_text = (
                 "SELECT table_name FROM all_tables "
                 f"WHERE owner = '{schema_upper}' ORDER BY table_name"
@@ -2071,8 +2087,13 @@ def _post_process_plan(plan: Dict[str, Any], state: QueryState) -> Dict[str, Any
     question_lower = state.get("question", "").lower()
     row_cap = state.get("row_cap") or 0
     dialect = (state.get("dialect") or "").lower()
-    if "column" in question_lower:
-        if all("all_tab_columns" not in sql.lower() for sql in adjusted):
+    # Only override with column metadata query if:
+    # 1. Question mentions "column" AND
+    # 2. It's NOT a COUNT query (e.g., "count columns" should not be overridden)
+    # 3. The SQL doesn't already query column metadata
+    is_count_query_in_any_sql = any("count(*)" in sql.lower() or "count (" in sql.lower() for sql in adjusted)
+    if "column" in question_lower and not is_count_query_in_any_sql:
+        if all("all_tab_columns" not in sql.lower() and "user_tab_columns" not in sql.lower() for sql in adjusted):
             if schema_upper:
                 base_columns_sql = (
                     "SELECT table_name, column_name, data_type FROM all_tab_columns "
