@@ -12,6 +12,16 @@ from typing import Dict, Optional
 LOGGER = logging.getLogger(__name__)
 
 
+def _normalize_schema_name(schema: str) -> str:
+    """
+    Normalize schema name to lowercase for SQLite storage and retrieval.
+    This ensures consistent schema name handling regardless of case in user input.
+    """
+    if not schema:
+        return schema
+    return schema.lower().strip()
+
+
 class MetadataCache:
     """
     SQLite-backed cache for table metadata (descriptions, sample values, schema hashes).
@@ -105,6 +115,7 @@ class MetadataCache:
                         )
 
     def fetch(self, schema: str, table_name: str) -> Optional[Dict[str, object]]:
+        schema = _normalize_schema_name(schema)
         with self._lock:
             cursor = self.conn.execute(
                 """
@@ -132,6 +143,7 @@ class MetadataCache:
         description: Optional[str],
         samples: Optional[Dict[str, list]] = None,
     ) -> None:
+        schema = _normalize_schema_name(schema)
         with self._lock:
             self.conn.execute(
                 """
@@ -157,6 +169,7 @@ class MetadataCache:
         schema_hash: str,
         samples: Dict[str, list],
     ) -> None:
+        schema = _normalize_schema_name(schema)
         existing = self.fetch(schema, table_name)
         if existing and existing["schema_hash"] == schema_hash:
             with self._lock:
@@ -194,6 +207,7 @@ class MetadataCache:
         """
         Return all cached metadata entries for a schema in a single query.
         """
+        schema = _normalize_schema_name(schema)
         with self._lock:
             cursor = self.conn.execute(
                 """

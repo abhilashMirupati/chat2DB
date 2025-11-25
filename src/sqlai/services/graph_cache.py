@@ -13,6 +13,16 @@ from typing import Any, Dict, Iterable, List, Literal, Optional, Sequence
 LOGGER = logging.getLogger(__name__)
 
 
+def _normalize_schema_name(schema: str) -> str:
+    """
+    Normalize schema name to lowercase for SQLite storage and retrieval.
+    This ensures consistent schema name handling regardless of case in user input.
+    """
+    if not schema:
+        return schema
+    return schema.lower().strip()
+
+
 CardType = Literal["table", "column", "relationship"]
 
 
@@ -131,6 +141,7 @@ class GraphCache:
                         )
 
     def get_table_hash(self, schema: str, table_name: str) -> Optional[str]:
+        schema = _normalize_schema_name(schema)
         with self._lock:
             cursor = self.conn.execute(
                 """
@@ -149,6 +160,7 @@ class GraphCache:
         Return all cached schema hashes for a schema in a single query.
         Returns dict mapping table_name -> schema_hash.
         """
+        schema = _normalize_schema_name(schema)
         with self._lock:
             cursor = self.conn.execute(
                 """
@@ -168,9 +180,10 @@ class GraphCache:
         schema_hash: str,
         cards: Sequence[GraphCardRecord],
     ) -> None:
+        schema = _normalize_schema_name(schema)
         payload = [
             (
-                card.schema,
+                _normalize_schema_name(card.schema),
                 card.table,
                 card.card_type,
                 card.identifier,
@@ -209,6 +222,7 @@ class GraphCache:
             self.conn.commit()
 
     def delete_tables(self, schema: str, tables: Iterable[str]) -> None:
+        schema = _normalize_schema_name(schema)
         tables = list(tables)
         if not tables:
             return
@@ -223,6 +237,7 @@ class GraphCache:
             self.conn.commit()
 
     def list_tables(self, schema: str) -> List[str]:
+        schema = _normalize_schema_name(schema)
         with self._lock:
             cursor = self.conn.execute(
                 """
@@ -236,6 +251,7 @@ class GraphCache:
         return [row[0] for row in rows]
 
     def get_cards_for_table(self, schema: str, table_name: str) -> List[GraphCardRecord]:
+        schema = _normalize_schema_name(schema)
         with self._lock:
             cursor = self.conn.execute(
                 """
@@ -271,6 +287,7 @@ class GraphCache:
         """
         params: Sequence[str] = ()
         if schema:
+            schema = _normalize_schema_name(schema)
             query += " WHERE schema_name = ?"
             params = (schema,)
         with self._lock:

@@ -5,7 +5,7 @@ Semantic retrieval utilities for Graph-RAG selection.
 from __future__ import annotations
 
 from dataclasses import dataclass
-from typing import Dict, List, Optional, Sequence, Set, Tuple
+from typing import Any, Dict, List, Optional, Sequence, Set, Tuple
 
 import numpy as np
 import requests
@@ -157,6 +157,7 @@ class SemanticRetriever:
         max_columns: Optional[int] = None,  # None = no limit, include ALL columns
         fk_expansion_max_depth: int = 3,  # Maximum hop depth for FK expansion
         fk_expansion_max_tables: int = 20,  # Maximum additional tables to add via FK expansion
+        table_filter: Optional[List[str]] = None,  # Optional list of table names to filter vector search
     ) -> RetrievalResult:
         """
         Select relevant graph cards using semantic search on tables only.
@@ -166,63 +167,38 @@ class SemanticRetriever:
         LOGGER.info("GRAPH CARD RETRIEVAL - Starting selection for query: %s", question)
         LOGGER.info("=" * 80)
         
-        # Step 1: Heuristic table ranking
-        heuristic_tables = graph.rank_tables(question, max_cards=max_tables)
-        LOGGER.info("Step 1 - Heuristic table ranking: %d tables", len(heuristic_tables))
-        for idx, card in enumerate(heuristic_tables, 1):
-            LOGGER.info("  %d. %s (heuristic score: 1.0)", idx, card.name)
+        # Using only vector search (embeddings are pre-computed via prewarm_metadata.py)
+        # On-the-fly semantic search removed since all embeddings are already in vector store
 
-        sim_tables: List[Tuple[TableCard, float]] = []
         vector_tables: List[Tuple[TableCard, float]] = []
 
-        # Step 2: On-the-fly semantic similarity for tables (fallback if vector store not available)
-        if self.provider:
-            try:
-                LOGGER.info("Step 2a - On-the-fly semantic similarity for tables (provider: %s)", 
-                           type(self.provider).__name__)
-                table_texts = [card.render() for card in graph.tables]
-                table_scores = self.provider.similarities(question, table_texts)
-                sim_tables = sorted(
-                    zip(graph.tables, table_scores),
-                    key=lambda item: item[1],
-                    reverse=True,
-                )
-                LOGGER.info("  Found %d tables with semantic scores", len(sim_tables))
-                for idx, (card, score) in enumerate(sim_tables[:max_tables], 1):
-                    LOGGER.info("  %d. %s (semantic score: %.4f)", idx, card.name, score)
-            except Exception as exc:  # noqa: BLE001
-                LOGGER.warning(
-                    "On-the-fly semantic similarity call failed: %s",
-                    exc,
-                    extra={
-                        "provider": type(self.provider).__name__,
-                        "model": getattr(self.provider, "model", None),
-                        "question": question,
-                        "error": repr(exc),
-                    },
-                )
-                sim_tables = []
-
-        # Step 3: Vector store semantic search for tables only
+        # Vector store semantic search for tables only (with similarity threshold)
         if self.vector_store and self.provider:
-            LOGGER.info("Step 2b - Vector store semantic search for table cards only")
+            if table_filter:
+                LOGGER.info("Step 1 - Vector store semantic search for table cards (similarity threshold: 0.75, filtered to %d tables)", len(table_filter))
+            else:
+                LOGGER.info("Step 1 - Vector store semantic search for table cards (similarity threshold: 0.75)")
             vector_tables = self._vector_hits(
                 question,
                 graph,
                 max_tables=max_tables,
+                similarity_threshold=0.75,
+                table_filter=table_filter,
             )
-            LOGGER.info("  Found %d tables from vector store", len(vector_tables))
+            LOGGER.info("  Found %d tables from vector store (score >= 0.75)", len(vector_tables))
             for idx, (card, score) in enumerate(vector_tables, 1):
                 LOGGER.info("  %d. %s (vector score: %.4f)", idx, card.name, score)
         else:
-            LOGGER.info("Step 2b - Vector store not available (vector_store=%s, provider=%s)", 
+            LOGGER.warning("Vector store not available (vector_store=%s, provider=%s) - cannot retrieve tables", 
                        self.vector_store is not None, self.provider is not None)
+            if not self.vector_store:
+                LOGGER.warning("  Run 'python scripts/prewarm_metadata.py' to generate embeddings")
 
-        # Step 4: Merge heuristic + semantic + vector table results
-        LOGGER.info("Step 3 - Merging table results (heuristic + semantic + vector)")
+        # Use vector search results directly (no merging needed since we only use vector search)
+        LOGGER.info("Step 2 - Using vector search results")
         selected_tables = self._merge_tables(
-            heuristic_tables,
-            sim_tables + vector_tables,
+            [],  # No heuristic tables
+            vector_tables,
             max_tables,
             graph,  # Pass graph for schema preference logic
         )
@@ -251,6 +227,16 @@ class SemanticRetriever:
                 for card in new_tables:
                     schema_prefix = f"{card.schema}." if card.schema else ""
                     LOGGER.info("    + %s%s (added via FK reference)", schema_prefix, card.name)
+                
+                # Log if FK expansion added tables not in filter (for accuracy)
+                if table_filter:
+                    filter_set = {t.lower() for t in table_filter}
+                    tables_not_in_filter = [t for t in new_tables if t.name.lower() not in filter_set]
+                    if tables_not_in_filter:
+                        LOGGER.info("  FK expansion added %d table(s) not in filter (required for join accuracy): %s",
+                                   len(tables_not_in_filter),
+                                   [t.name for t in tables_not_in_filter[:5]])
+                
                 selected_tables = expanded_tables
             else:
                 LOGGER.info("  No additional tables needed (all FK-referenced tables already selected)")
@@ -323,11 +309,10 @@ class SemanticRetriever:
         LOGGER.info("Step 6 - Validation checks")
         if not selected_tables:
             LOGGER.error("  ⚠️  CRITICAL: No tables selected! This will cause issues.")
-            LOGGER.error("     Heuristic tables: %d", len(heuristic_tables))
-            LOGGER.error("     Semantic tables: %d", len(sim_tables))
-            LOGGER.error("     Vector tables: %d", len(vector_tables))
+            LOGGER.error("     Vector tables (score >= 0.75): %d", len(vector_tables))
             LOGGER.error("     Available tables in graph: %s", 
                         [t.name for t in graph.tables[:10]])
+            LOGGER.error("     Run 'python scripts/prewarm_metadata.py' if vector store is empty")
             # Don't raise exception - let caller handle it, but log clearly
         else:
             LOGGER.info("  ✅ Tables: %d selected", len(selected_tables))
@@ -356,8 +341,6 @@ class SemanticRetriever:
         LOGGER.info("=" * 80)
 
         details = {
-            "heuristic_tables": [(card.name, 1.0) for card in heuristic_tables],
-            "semantic_tables": [(card.name, float(score)) for card, score in sim_tables[:max_tables]],
             "vector_tables": [(card.name, float(score)) for card, score in vector_tables[:max_tables]],
             "selected_columns": [(f"{card.table}.{card.column.name}", 1.0) for card in selected_columns],
             "selected_relationships": [rel.render() for rel in selected_relationships],
@@ -375,30 +358,60 @@ class SemanticRetriever:
         graph: GraphContext,
         *,
         max_tables: int,
+        similarity_threshold: float = 0.75,
+        table_filter: Optional[List[str]] = None,  # Optional list of table names to filter vector search
     ) -> List[Tuple[TableCard, float]]:
         """
         Vector retrieval for table cards only:
         Query table cards to identify relevant tables.
+        Only returns tables with similarity score >= threshold.
         Once we have top K tables, we get ALL columns and relationships for those tables.
+        
+        Args:
+            question: User's natural language question
+            graph: GraphContext containing all tables
+            max_tables: Maximum number of tables to return
+            similarity_threshold: Minimum similarity score (0.0-1.0) to include a table. Default: 0.75
+            table_filter: Optional list of table names to filter vector search. If provided, only these tables will be searched.
         """
         if not self.vector_store or not self.provider:
             LOGGER.debug("Vector store or provider not available, skipping vector search")
             return []
         
+        # Filter tables if table_filter is provided
+        tables_to_search = graph.tables
+        if table_filter:
+            # Filter to only selected tables (case-insensitive matching)
+            filter_set = {t.lower() for t in table_filter}
+            tables_to_search = [t for t in graph.tables if t.name.lower() in filter_set]
+            LOGGER.info("Filtering vector search to %d selected tables (from %d total tables)", 
+                       len(tables_to_search), len(graph.tables))
+            if not tables_to_search:
+                LOGGER.warning("Table filter resulted in 0 tables - no tables match the filter. Using all tables instead.")
+                tables_to_search = graph.tables
+        
         # Build case-insensitive lookup: lowercase name -> TableCard
-        table_map = {card.name.lower(): card for card in graph.tables}
-        table_map_original = {card.name: card for card in graph.tables}  # Keep original for exact match first
-        LOGGER.debug("Querying vector store for table cards (max_tables=%d, available tables in graph: %d)", 
-                    max_tables, len(table_map))
+        table_map = {card.name.lower(): card for card in tables_to_search}
+        table_map_original = {card.name: card for card in tables_to_search}  # Keep original for exact match first
+        LOGGER.debug("Querying vector store for table cards (max_tables=%d, threshold=%.2f, available tables in graph: %d)", 
+                    max_tables, similarity_threshold, len(table_map))
         
         # Query table cards only
         table_hits: List[Tuple[TableCard, float]] = []
         try:
+            # Build where clause for vector store query
+            where_clause: Dict[str, Any] = {"card_type": "table"}
+            if table_filter and tables_to_search:
+                # Filter by table names in vector store query
+                table_names_in_filter = [t.name for t in tables_to_search]
+                where_clause["table"] = {"$in": table_names_in_filter}
+                LOGGER.debug("Vector store query filtered to %d tables: %s", len(table_names_in_filter), table_names_in_filter[:5])
+            
             table_results = self.vector_store.query(
                 question,
                 self.provider,
-                top_k=max_tables * 2,  # Get more candidates to account for filtering
-                where={"card_type": "table"},
+                top_k=max_tables * 3,  # Get more candidates to account for threshold filtering
+                where=where_clause,
             )
             LOGGER.debug("Vector store returned %d table results", len(table_results))
         except Exception as exc:  # noqa: BLE001
@@ -406,6 +419,7 @@ class SemanticRetriever:
             return []
         
         matched_count = 0
+        filtered_count = 0
         unmatched_tables = []
         for hit in table_results:
             metadata = hit.get("metadata") or {}
@@ -413,6 +427,12 @@ class SemanticRetriever:
             table_name = metadata.get("table")
             if not table_name:
                 LOGGER.warning("Vector store hit missing 'table' in metadata: %s", metadata)
+                continue
+            
+            # Apply similarity threshold filter
+            if score < similarity_threshold:
+                filtered_count += 1
+                LOGGER.debug("Filtered out table '%s' (score %.4f < threshold %.2f)", table_name, score, similarity_threshold)
                 continue
             
             # Try exact match first, then case-insensitive
@@ -429,11 +449,12 @@ class SemanticRetriever:
             LOGGER.warning("Vector store returned %d table(s) not found in graph: %s", 
                           len(unmatched_tables), unmatched_tables[:5])
         
+        # Sort by score (descending) and limit to max_tables
         table_hits.sort(key=lambda item: item[1], reverse=True)
         table_hits = table_hits[:max_tables]
         
-        LOGGER.debug("Matched %d/%d vector results to graph tables, returning top %d", 
-                    matched_count, len(table_results), len(table_hits))
+        LOGGER.info("Vector search results: %d matched (score >= %.2f), %d filtered (score < %.2f), returning top %d", 
+                    matched_count, similarity_threshold, filtered_count, similarity_threshold, len(table_hits))
         
         return table_hits
 

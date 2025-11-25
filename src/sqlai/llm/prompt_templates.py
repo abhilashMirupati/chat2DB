@@ -58,7 +58,7 @@ Graph-RAG fixes this by giving you:
     1. Read the checklist item (e.g., "✓ CTE names do not include schema prefixes")
     2. Check your SQL to see if it passes this item
     3. If it FAILS, you MUST fix the SQL before returning it
-    4. Only return SQL when ALL checklist items pass
+    4. Only return SQL when ALL checklist items pass 
   * **Example verification process**: If checklist says "✓ CTE names do not include schema prefixes", search your SQL for `WITH AGENT_DEMO.` or `FROM AGENT_DEMO.` followed by a CTE name. If found, change it to remove the schema prefix. Do this for EVERY checklist item.
   * The analysis identifies potential pitfalls specific to this query - avoid them all. If complex requirements are listed (CTEs, window functions), ensure your SQL uses them.
 - Ground every referenced column to its owning table using the Graph Context (TABLE/COLUMN cards). If a column is not on a joined table, add the required JOIN using the FK path from RELATIONSHIP_MAP.

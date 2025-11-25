@@ -64,6 +64,10 @@ PERSISTED_SESSION_KEYS = [
     "embedding_model",
     "embedding_base_url",
     "embedding_api_key",
+    "table_filter_groups",
+    "active_table_filter_group",
+    "table_filter_expanded",
+    "selected_tables_for_query",
 ]
 
 st.markdown(
@@ -170,6 +174,10 @@ def init_session_state() -> None:
         "saved_queries": [],
         "saved_query_result": None,
         "_last_session_loaded": False,
+        "table_filter_groups": {},  # Dict[str, List[str]] - group name -> list of table names
+        "active_table_filter_group": None,  # str - currently selected group name
+        "table_filter_expanded": False,  # bool - UI expand/collapse state
+        "selected_tables_for_query": [],  # List[str] - currently selected table names for filtering
     }
     for key, value in defaults.items():
         st.session_state.setdefault(key, value)
@@ -685,30 +693,67 @@ def sidebar_configuration() -> None:
         
         # Check if schema is selected (required for most databases, especially Oracle)
         schema_validation_error = None
+        # Calculate actual_schema based on user's selection (needed for both validation and config creation)
+        schema_choice = st.session_state.get("schema_select_option", "(current schema)")
+        manual_schema = st.session_state.get("db_schema", "")
+        
+        # Determine the actual schema value
+        if schema_choice == "(current schema)":
+            actual_schema = ""  # Empty string triggers URL extraction in AnalyticsService._schema_key()
+        elif schema_choice == "(manual entry)":
+            actual_schema = manual_schema.strip() if manual_schema else None
+        else:
+            actual_schema = schema_choice
+        
         if not db_error:  # Only check schema if DB URL is valid
-            schema_choice = st.session_state.get("schema_select_option", "(current schema)")
-            manual_schema = st.session_state.get("db_schema", "")
-            
-            # Determine the actual schema value
-            if schema_choice == "(current schema)":
-                actual_schema = None  # Will use default schema
-            elif schema_choice == "(manual entry)":
-                actual_schema = manual_schema.strip() if manual_schema else None
-            else:
-                actual_schema = schema_choice
-            
             # For Oracle databases, schema is typically required
             # Check if DB URL suggests Oracle (oracle:// or contains :1521)
             is_oracle = "oracle" in db_url.lower() or ":1521" in db_url or "oracle" in (st.session_state.get("db_type", "") or "").lower()
             
             if not actual_schema:
                 if is_oracle:
-                    # Oracle: Make it an error (blocking)
-                    schema_validation_error = (
-                        "⚠️ **Schema selection required for Oracle database.**\n\n"
-                        "Please select a schema from the dropdown or enter one manually in the 'Database' section. "
-                        "Initializing without a schema can take a very long time as it tries to introspect all schemas."
-                    )
+                    # For Oracle with "(current schema)", try to extract username from URL
+                    # If we can extract it, we have a schema, so don't show error
+                    if schema_choice == "(current schema)":
+                        try:
+                            from urllib.parse import urlparse, unquote
+                            parsed = urlparse(db_url)
+                            if parsed.username:
+                                username = unquote(parsed.username)
+                                if username:
+                                    # We can extract username from URL, so we have a schema
+                                    # Don't show error - AnalyticsService will use this username
+                                    LOGGER.info("Oracle URL username extraction: '%s' will be used as schema", username)
+                                    pass  # No error - schema will be extracted from URL
+                                else:
+                                    # Username is empty - show error
+                                    schema_validation_error = (
+                                        "⚠️ **Schema selection required for Oracle database.**\n\n"
+                                        "Could not extract username from connection URL. "
+                                        "Please select a schema from the dropdown or enter one manually in the 'Database' section."
+                                    )
+                            else:
+                                # No username in URL - show error
+                                schema_validation_error = (
+                                    "⚠️ **Schema selection required for Oracle database.**\n\n"
+                                    "No username found in connection URL. "
+                                    "Please select a schema from the dropdown or enter one manually in the 'Database' section."
+                                )
+                        except Exception as url_exc:  # noqa: BLE001
+                            # URL parsing failed - show error
+                            LOGGER.debug("Could not parse Oracle URL to extract username: %s", url_exc)
+                            schema_validation_error = (
+                                "⚠️ **Schema selection required for Oracle database.**\n\n"
+                                "Could not parse connection URL to extract username. "
+                                "Please select a schema from the dropdown or enter one manually in the 'Database' section."
+                            )
+                    else:
+                        # Not "(current schema)" and no schema provided - show error
+                        schema_validation_error = (
+                            "⚠️ **Schema selection required for Oracle database.**\n\n"
+                            "Please select a schema from the dropdown or enter one manually in the 'Database' section. "
+                            "Initializing without a schema can take a very long time as it tries to introspect all schemas."
+                        )
                 else:
                     # Other databases: Show warning but allow (some DBs don't require schema)
                     # We'll show this as a warning in the status, not blocking
@@ -723,8 +768,9 @@ def sidebar_configuration() -> None:
             st.session_state["connection_status"] = ("error", db_error)
             _render_status(st.session_state.get("connection_status"), db_status_placeholder)
         elif schema_validation_error:
-            st.session_state["connection_status"] = ("error", schema_validation_error)
-            _render_status(st.session_state.get("connection_status"), db_status_placeholder)
+            # Store schema validation error in session state to show in main UI (not sidebar)
+            st.session_state["schema_validation_error"] = schema_validation_error
+            # Don't show in sidebar - will show in main UI for better visibility
         elif llm_error:
             st.session_state["llm_status"] = ("error", llm_error)
             _render_status(st.session_state.get("llm_status"), llm_status_placeholder)
@@ -740,7 +786,7 @@ def sidebar_configuration() -> None:
                 
                 db_config = DatabaseConfig(
                     url=db_url,
-                    schema=schema or None,
+                    schema=actual_schema,  # Use actual_schema (None for "(current schema)" triggers URL extraction)
                     sample_row_limit=sample_limit,
                     thick_mode=thick_mode,
                     oracle_lib_dir=oracle_lib_dir or None,
@@ -816,6 +862,54 @@ def sidebar_configuration() -> None:
                     embedding_config=embedding_config,
                     skip_prewarm_if_cached=True,  # Use cache by default
                 )
+            except RuntimeError as exc:  # noqa: BLE001
+                error_msg = str(exc)
+                error_lower = error_msg.lower()
+                
+                # Show cache precheck message if available
+                cache_precheck = st.session_state.get("cache_precheck")
+                if cache_precheck:
+                    cache_type, cache_msg = cache_precheck
+                    if cache_type == "info":
+                        st.info(cache_msg)
+                    elif cache_type == "warning":
+                        st.warning(cache_msg)
+                
+                # Parse error to determine if it's LLM or embedding related
+                # Check for LLM errors (but not embedding errors)
+                is_llm_error = (
+                    ("llm" in error_lower or "failed to load llm" in error_lower or "llm provider" in error_lower) 
+                    and "embedding" not in error_lower
+                )
+                # Check for embedding errors
+                is_embedding_error = (
+                    "embedding" in error_lower 
+                    or "embedding provider failed" in error_lower
+                    or "embedding provider" in error_lower
+                )
+                
+                # Store errors in session state for display in main UI (not sidebar)
+                if is_llm_error:
+                    st.session_state["llm_init_error"] = error_msg
+                    LOGGER.error("LLM initialization failed: %s", exc, exc_info=True)
+                elif is_embedding_error:
+                    st.session_state["embedding_init_error"] = error_msg
+                    LOGGER.error("Embedding initialization failed: %s", exc, exc_info=True)
+                else:
+                    # Generic RuntimeError - show in sidebar
+                    enhanced_error = error_msg
+                    if "connection" in error_lower or "failed" in error_lower:
+                        enhanced_error = (
+                            f"{error_msg}\n\n"
+                            "**Troubleshooting:**\n"
+                            "1. Verify LLM provider is running (e.g., Ollama server for 'ollama' provider)\n"
+                            "2. Check API keys are correct (for Hugging Face, OpenAI, etc.)\n"
+                            "3. Test connections individually using 'Test LLM connection' and 'Test embedding connection' buttons\n"
+                            "4. Ensure all required fields are filled in the sidebar"
+                        )
+                    st.session_state["connection_status"] = ("error", enhanced_error)
+                    _render_status(st.session_state.get("connection_status"), db_status_placeholder)
+                    LOGGER.error("Agent initialization failed: %s", exc, exc_info=True)
             except Exception as exc:  # noqa: BLE001
                 error_msg = str(exc)
                 
@@ -828,33 +922,8 @@ def sidebar_configuration() -> None:
                     elif cache_type == "warning":
                         st.warning(cache_msg)
                 
-                # Enhance error message with specific guidance
-                enhanced_error = error_msg
-                error_lower = error_msg.lower()
-                if "llm" in error_lower or "provider" in error_lower:
-                    if "embedding" not in error_lower:
-                        enhanced_error = (
-                            f"{error_msg}\n\n"
-                            "**Required:** Configure LLM provider and model in the sidebar under 'LLM' section. "
-                            "Test the LLM connection before initializing the agent."
-                        )
-                elif "embedding" in error_lower:
-                    enhanced_error = (
-                        f"{error_msg}\n\n"
-                        "**Required:** Configure embedding provider and model in the sidebar under 'Embeddings' section. "
-                        "Test the embedding connection before initializing the agent."
-                    )
-                elif "connection" in error_lower or "failed" in error_lower:
-                    enhanced_error = (
-                        f"{error_msg}\n\n"
-                        "**Troubleshooting:**\n"
-                        "1. Verify LLM provider is running (e.g., Ollama server for 'ollama' provider)\n"
-                        "2. Check API keys are correct (for Hugging Face, OpenAI, etc.)\n"
-                        "3. Test connections individually using 'Test LLM connection' and 'Test embedding connection' buttons\n"
-                        "4. Ensure all required fields are filled in the sidebar"
-                    )
-                
-                st.session_state["connection_status"] = ("error", enhanced_error)
+                # Generic error handling - show in sidebar
+                st.session_state["connection_status"] = ("error", error_msg)
                 _render_status(st.session_state.get("connection_status"), db_status_placeholder)
                 LOGGER.error("Agent initialization failed: %s", exc, exc_info=True)
             else:
@@ -920,6 +989,10 @@ def sidebar_configuration() -> None:
         st.session_state["schema_select_option"] = "(current schema)"
         st.session_state["embedding_status"] = None
         st.session_state["conversation_history"] = []
+        # Clear cached connection test results so they can be retested on next initialization
+        st.session_state.pop("connection_tests_done", None)
+        st.session_state.pop("llm_connection_test_result", None)
+        st.session_state.pop("embedding_connection_test_result", None)
         _clear_persisted_session_config()
 
     if test_llm_clicked:
@@ -1033,25 +1106,42 @@ def _test_embedding_connection(
                 parameters["base_url"] = base_url.rstrip("/")
             client = InferenceClient(provider="hf-inference", api_key=api_key, **parameters)
             try:
-                payload = {
-                    "source_sentence": "ping",
-                    "sentences": ["pong", "embedding test"],
-                }
+                # Use feature_extraction (same API as actual embedding generation) to catch quota/payment issues
                 LOGGER.debug(
-                    "Sending Hugging Face sentence_similarity request",
+                    "Testing Hugging Face feature_extraction (same API as actual embedding generation)",
                     extra={"model": model},
                 )
+                test_text = "embedding connection test"
+                output = client.feature_extraction(test_text, model=model)
+                # Convert to numpy array to check dimensions (same as actual embed_many)
                 try:
-                    result = client.sentence_similarity("ping", ["pong", "embedding test"], model=model)
-                except TypeError:
-                    result = client.sentence_similarity(payload, model=model)
-                return "success", f"Hugging Face embedding OK (scores: {', '.join(f'{score:.3f}' for score in result)})"
+                    import numpy as np
+                except ImportError:
+                    # If numpy not available, just check if output is a list/array
+                    vector_size = len(output) if hasattr(output, "__len__") else 1
+                    return "success", f"Hugging Face embedding OK (vector size: {vector_size})"
+                array = np.array(output, dtype=np.float32)
+                if array.ndim > 1:
+                    array = array.mean(axis=0)
+                vector_size = len(array)
+                return "success", f"Hugging Face embedding OK (vector size: {vector_size})"
             except Exception as inner_exc:  # noqa: BLE001
                 LOGGER.exception(
                     "Hugging Face embedding test failed",
                     extra={"model": model},
                 )
-                return "error", f"{type(inner_exc).__name__}: {inner_exc}"
+                error_msg = str(inner_exc)
+                # Detect quota/payment errors and provide helpful message
+                if "402" in error_msg or "Payment Required" in error_msg or "exceeded" in error_msg.lower() or "quota" in error_msg.lower():
+                    return "error", (
+                        f"Embedding quota/payment limit reached: {error_msg}\n\n"
+                        "This means your Hugging Face account has exceeded the monthly included credits. "
+                        "You can either:\n"
+                        "1. Subscribe to Hugging Face PRO for more credits\n"
+                        "2. Wait for the quota to reset\n"
+                        "3. Use a different embedding provider (e.g., Ollama)"
+                    )
+                return "error", f"{type(inner_exc).__name__}: {error_msg}"
         if provider_key == "ollama":
             url = (base_url or "http://localhost:11434").rstrip("/")
             try:
@@ -1147,6 +1237,148 @@ def _render_schema_from_cache(
             LOGGER.exception("Error loading schema from cache")
             st.error(f"Could not load schema from cache: {exc}")
             st.info("This might happen if the cache is incomplete. Run 'python scripts/prewarm_metadata.py' to populate the cache.")
+
+
+def render_table_filter(service: AnalyticsService) -> None:
+    """
+    Render table filtering UI component with group management.
+    Allows users to select specific tables to filter vector search.
+    """
+    if not service or not service.graph_context:
+        return
+    
+    # Get all tables from current schema
+    all_tables = service.graph_context.tables
+    if not all_tables:
+        return
+    
+    # Get current schema for filtering
+    current_schema = service.db_config.schema or service._schema_key() or "(default)"
+    
+    # Filter tables by current schema
+    schema_tables = [t for t in all_tables if (t.schema or "(default)") == current_schema]
+    if not schema_tables:
+        # If no schema match, use all tables
+        schema_tables = all_tables
+    
+    table_names = sorted([t.name for t in schema_tables])
+    
+    # Initialize session state if needed
+    if "table_filter_groups" not in st.session_state:
+        st.session_state["table_filter_groups"] = {}
+    if "active_table_filter_group" not in st.session_state:
+        st.session_state["active_table_filter_group"] = None
+    if "selected_tables_for_query" not in st.session_state:
+        st.session_state["selected_tables_for_query"] = []
+    
+    # Get current state
+    groups = st.session_state.get("table_filter_groups", {})
+    active_group = st.session_state.get("active_table_filter_group")
+    selected_tables = st.session_state.get("selected_tables_for_query", [])
+    
+    with st.expander("🔍 Filter Tables (Optional)", expanded=st.session_state.get("table_filter_expanded", False)):
+        st.caption(
+            "💡 **Tip:** Select specific tables to speed up vector search for large databases. "
+            "FK relationships will still be expanded for accuracy."
+        )
+        
+        # Group Management Section
+        st.subheader("📁 Group Management", divider="gray")
+        
+        # Group selection dropdown
+        group_options = ["(No group)", "(Create new group)"] + list(groups.keys())
+        group_index = 0
+        if active_group and active_group in groups:
+            group_index = group_options.index(active_group)
+        
+        selected_group_option = st.selectbox(
+            "Select or create group",
+            options=group_options,
+            index=group_index,
+            help="Groups allow you to save and reuse table selections",
+        )
+        
+        # Handle group selection
+        if selected_group_option == "(No group)":
+            st.session_state["active_table_filter_group"] = None
+        elif selected_group_option == "(Create new group)":
+            new_group_name = st.text_input(
+                "New group name",
+                value="",
+                placeholder="e.g., Sales Tables, HR Tables",
+                help="Enter a name for the new group",
+            )
+            if new_group_name.strip():
+                if st.button("Create Group", type="secondary"):
+                    groups[new_group_name.strip()] = []
+                    st.session_state["table_filter_groups"] = groups
+                    st.session_state["active_table_filter_group"] = new_group_name.strip()
+                    st.rerun()
+        else:
+            # Existing group selected
+            st.session_state["active_table_filter_group"] = selected_group_option
+            # Load group's tables if different from current selection
+            if groups[selected_group_option] != selected_tables:
+                st.session_state["selected_tables_for_query"] = groups[selected_group_option].copy()
+                st.rerun()
+        
+        # Group actions (only if group is selected)
+        if active_group and active_group in groups:
+            col1, col2 = st.columns(2)
+            with col1:
+                if st.button("💾 Save Current Selection to Group", type="secondary"):
+                    groups[active_group] = selected_tables.copy()
+                    st.session_state["table_filter_groups"] = groups
+                    st.success(f"Saved {len(selected_tables)} tables to group '{active_group}'")
+            with col2:
+                if st.button("🗑️ Delete Group", type="secondary"):
+                    del groups[active_group]
+                    st.session_state["table_filter_groups"] = groups
+                    if st.session_state["active_table_filter_group"] == active_group:
+                        st.session_state["active_table_filter_group"] = None
+                    st.rerun()
+        
+        st.divider()
+        
+        # Table Selection Section
+        st.subheader("📊 Table Selection", divider="gray")
+        
+        # Search/filter input
+        search_term = st.text_input(
+            "🔍 Search tables",
+            value="",
+            placeholder="Type to filter table names...",
+            help="Filter tables by name (partial match)",
+        )
+        
+        # Filter table names by search term
+        filtered_table_names = table_names
+        if search_term:
+            search_lower = search_term.lower()
+            filtered_table_names = [t for t in table_names if search_lower in t.lower()]
+        
+        # Multi-select widget
+        selected_tables_new = st.multiselect(
+            "Select tables to filter",
+            options=filtered_table_names,
+            default=selected_tables,
+            help=f"Select tables to limit vector search. Leave empty to search all {len(table_names)} tables.",
+        )
+        
+        # Update session state
+        st.session_state["selected_tables_for_query"] = selected_tables_new
+        
+        # Display selection info
+        if selected_tables_new:
+            st.info(f"✅ **{len(selected_tables_new)} of {len(table_names)} tables selected.** Vector search will only search these tables.")
+        else:
+            st.info(f"ℹ️ **No tables selected.** Vector search will use all {len(table_names)} tables.")
+        
+        # Info message about FK expansion
+        st.caption(
+            "📌 **Note:** When tables are selected, vector search is filtered to these tables only. "
+            "FK relationships will still be expanded automatically to ensure join accuracy."
+        )
 
 
 def render_schema(service: AnalyticsService) -> None:
@@ -1277,14 +1509,24 @@ def main() -> None:
     
     # Try to get DB config from session state
     db_url = st.session_state.get("db_url", "")
-    # Get schema from session state - this is the actual selected schema
-    selected_schema = st.session_state.get("db_schema", "")
+    # Calculate actual schema based on user's selection (same logic as sidebar)
+    schema_choice = st.session_state.get("schema_select_option", "(current schema)")
+    manual_schema = st.session_state.get("db_schema", "")
+    
+    # Determine the actual schema value
+    if schema_choice == "(current schema)":
+        actual_schema = ""  # Empty string triggers URL extraction in AnalyticsService._schema_key()
+    elif schema_choice == "(manual entry)":
+        actual_schema = manual_schema.strip() if manual_schema else ""
+    else:
+        actual_schema = schema_choice  # Selected from dropdown
     
     # Log the schema being used for debugging
     LOGGER.info(
-        "Main function: db_url='%s', selected_schema from session_state='%s'",
+        "Main function: db_url='%s', schema_choice='%s', actual_schema='%s'",
         db_url[:50] + "..." if len(db_url) > 50 else db_url,
-        selected_schema or "(empty/None)",
+        schema_choice,
+        actual_schema or "(empty - will extract from URL)",
     )
     
     # Check if user has actually configured database (not just empty)
@@ -1294,7 +1536,7 @@ def main() -> None:
         try:
             db_config = DatabaseConfig(
                 url=db_url,
-                schema=selected_schema.strip() if selected_schema else None,  # Use selected_schema, strip whitespace
+                schema=actual_schema if actual_schema else None,  # Use actual_schema (empty string becomes None)
                 sample_row_limit=st.session_state.get("sample_limit", 100),
                 thick_mode=st.session_state.get("oracle_thick_mode", False),
                 oracle_lib_dir=st.session_state.get("oracle_lib_dir") or None,
@@ -1391,6 +1633,11 @@ def main() -> None:
             except Exception as exc:  # noqa: BLE001
                 missing_requirements.append(f"**Embedding**: Configuration error: {str(exc)}. Check the sidebar under 'Embeddings' section.")
     
+    # Show schema validation error in main UI (if present) - more visible than sidebar
+    schema_validation_error = st.session_state.pop("schema_validation_error", None)
+    if schema_validation_error:
+        st.error(schema_validation_error)
+    
     # Only show configuration errors if user has actually started configuring something
     # OR if they've tried to initialize the agent
     service_initialized_attempted = st.session_state.get("service_initialised", False)
@@ -1403,18 +1650,107 @@ def main() -> None:
     service = init_service()
     service_ready = False
     
+    # Get initialization errors from session state (set during service initialization attempt)
+    # Use get() instead of pop() so errors persist until we display them
+    llm_init_error = st.session_state.get("llm_init_error")
+    embedding_init_error = st.session_state.get("embedding_init_error")
+    
+    # Initialize connection test errors
+    llm_connection_error = None
+    embedding_connection_error = None
+    
     if not service:
         if st.session_state.get("service_initialised"):
-            st.error("❌ Agent initialisation failed. Check the sidebar configuration and logs for details.")
+            # Service initialization was attempted but failed
+            # Errors should already be in llm_init_error or embedding_init_error
+            pass
         # Don't return early - continue to show schema from cache if available
     else:
         # Service initialized - check if it's fully ready
-        try:
-            if service.llm_config and service.llm_config.provider and service.llm_config.model:
-                if service.embedding_config and service.embedding_config.provider and service.embedding_config.model:
-                    service_ready = True
-        except Exception:  # noqa: BLE001
-            pass
+        # Only test connections once after initialization, not on every rerun
+        # Cache connection test results in session state to avoid repeated API calls
+        connection_tests_done_key = "connection_tests_done"
+        if not st.session_state.get(connection_tests_done_key, False):
+            # First time after initialization - test connections once
+            try:
+                if service.llm_config and service.llm_config.provider and service.llm_config.model:
+                    if service.embedding_config and service.embedding_config.provider and service.embedding_config.model:
+                        # Test LLM connection (only once)
+                        try:
+                            llm_status = _test_llm_connection(
+                                service.llm_config.provider,
+                                service.llm_config.model,
+                                service.llm_config.base_url,
+                                service.llm_config.api_key,
+                            )
+                            if llm_status[0] == "error":
+                                llm_connection_error = llm_status[1]
+                        except Exception as exc:  # noqa: BLE001
+                            llm_connection_error = f"Failed to test LLM connection: {str(exc)}"
+                        
+                        # Test embedding connection (only once)
+                        try:
+                            embedding_status = _test_embedding_connection(
+                                service.embedding_config.provider,
+                                service.embedding_config.model,
+                                service.embedding_config.base_url,
+                                service.embedding_config.api_key,
+                            )
+                            if embedding_status[0] == "error":
+                                embedding_connection_error = embedding_status[1]
+                        except Exception as exc:  # noqa: BLE001
+                            embedding_connection_error = f"Failed to test embedding connection: {str(exc)}"
+                        
+                        # Mark connection tests as done (cache results)
+                        st.session_state[connection_tests_done_key] = True
+                        st.session_state["llm_connection_test_result"] = llm_connection_error
+                        st.session_state["embedding_connection_test_result"] = embedding_connection_error
+                        
+                        # Only mark as ready if both connections work
+                        if not llm_connection_error and not embedding_connection_error:
+                            service_ready = True
+            except Exception:  # noqa: BLE001
+                pass
+        else:
+            # Use cached connection test results (don't retest on every rerun)
+            cached_llm_error = st.session_state.get("llm_connection_test_result")
+            cached_embedding_error = st.session_state.get("embedding_connection_test_result")
+            if cached_llm_error:
+                llm_connection_error = cached_llm_error
+            if cached_embedding_error:
+                embedding_connection_error = cached_embedding_error
+            
+            # Service is ready if no cached errors
+            if not cached_llm_error and not cached_embedding_error:
+                service_ready = True
+        
+        # Show table filter UI if service is ready
+        if service_ready and service:
+            render_table_filter(service)
+    
+    # Show connection errors in main UI if present (from connection tests or initialization)
+    # This is outside the if service block so errors are shown even if service initialization failed
+    # Clear errors from session state after displaying them
+    if llm_connection_error or llm_init_error:
+        error_msg = llm_connection_error or llm_init_error
+        st.error(
+            f"**⚠️ LLM Connection Failed**\n\n"
+            f"{error_msg}\n\n"
+            f"Please check your LLM configuration in the sidebar under 'LLM' section and test the connection."
+        )
+        # Clear error from session state after displaying
+        if llm_init_error:
+            st.session_state.pop("llm_init_error", None)
+    if embedding_connection_error or embedding_init_error:
+        error_msg = embedding_connection_error or embedding_init_error
+        st.error(
+            f"**⚠️ Embedding Connection Failed**\n\n"
+            f"{error_msg}\n\n"
+            f"Please check your embedding configuration in the sidebar under 'Embeddings' section and test the connection."
+        )
+        # Clear error from session state after displaying
+        if embedding_init_error:
+            st.session_state.pop("embedding_init_error", None)
     
     # Try to render schema from cache even if service isn't fully initialized
     if db_config:
@@ -1444,7 +1780,22 @@ def main() -> None:
                         "db_config.schema is empty string (user selected '(current schema)'), will get default from engine"
                     )
             
-            # Priority 2: If schema not set or empty, get default from engine (same as AnalyticsService)
+            # Priority 2: Extract username from Oracle URL (same as AnalyticsService._schema_key())
+            if not schema_to_check and "oracle" in db_config.url.lower():
+                try:
+                    from urllib.parse import urlparse, unquote
+                    # Parse the URL to extract username
+                    # Format: oracle+oracledb://username:password@host:port/?service_name=...
+                    parsed = urlparse(db_config.url)
+                    if parsed.username:
+                        username = unquote(parsed.username)
+                        if username:
+                            schema_to_check = username
+                            LOGGER.info("Extracted username from Oracle URL as default schema: '%s'", schema_to_check)
+                except Exception as url_exc:  # noqa: BLE001
+                    LOGGER.debug("Could not extract username from Oracle URL: %s", url_exc)
+            
+            # Priority 3: If schema still not set, get default from engine (same as AnalyticsService)
             if not schema_to_check:
                 try:
                     # Create temporary engine to get default schema (same logic as AnalyticsService._schema_key())
@@ -1475,8 +1826,23 @@ def main() -> None:
             app_config = load_app_config()
             metadata_cache = MetadataCache(app_config.cache_dir / "table_metadata.db")
             graph_cache = GraphCache(app_config.cache_dir / "graph_cards.db")
-            metadata_tables = metadata_table_names(metadata_cache, schema_to_check)
-            graph_tables = set(graph_cache.list_tables(schema_to_check))
+            
+            # Normalize schema key to lowercase for cache lookup (matches cache storage normalization)
+            # Both MetadataCache and GraphCache normalize schema names to lowercase
+            schema_key_normalized = schema_to_check.lower() if schema_to_check else "(default)"
+            if schema_key_normalized == "(default)":
+                schema_key_normalized = "(default)"  # Keep as-is
+            else:
+                schema_key_normalized = schema_key_normalized.strip()
+            
+            LOGGER.info(
+                "Cache lookup: original schema='%s', normalized schema='%s'",
+                schema_to_check,
+                schema_key_normalized,
+            )
+            
+            metadata_tables = metadata_table_names(metadata_cache, schema_key_normalized)
+            graph_tables = set(graph_cache.list_tables(schema_key_normalized))
             
             LOGGER.info(
                 "Cache lookup results for schema '%s': %s metadata tables, %s graph tables",
@@ -1583,10 +1949,15 @@ def main() -> None:
             spinner_text = "Generating new query..." if skip_similarity else "Checking for similar questions..."
             with st.spinner(spinner_text):
                 try:
+                    # Get selected tables from filter (if any)
+                    selected_tables = st.session_state.get("selected_tables_for_query", [])
+                    table_filter = selected_tables if selected_tables else None
+                    
                     result = service.ask(
                         question, 
                         skip_similarity_check=skip_similarity,
                         desired_columns=desired_columns if desired_columns else None,
+                        table_filter=table_filter,  # Pass table filter to limit vector search
                     )
                 except ValueError as exc:
                     st.warning(str(exc))

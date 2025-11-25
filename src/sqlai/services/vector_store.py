@@ -218,8 +218,22 @@ class VectorStoreManager:
             embeddings = embedder.embed_many(documents)
         except Exception as exc:  # noqa: BLE001
             LOGGER.error("Failed to embed graph cards for table '%s': %s", table, exc)
+            error_msg = str(exc)
+            # Detect quota/payment errors and provide helpful message
+            if "402" in error_msg or "Payment Required" in error_msg or "exceeded" in error_msg.lower() or "quota" in error_msg.lower():
+                raise RuntimeError(
+                    f"Embedding provider quota/payment limit reached while processing table '{table}'. "
+                    f"Error: {error_msg}\n\n"
+                    "Your Hugging Face account has exceeded the monthly included credits. "
+                    "Options:\n"
+                    "1. Subscribe to Hugging Face PRO for more credits\n"
+                    "2. Wait for the quota to reset\n"
+                    "3. Use a different embedding provider (e.g., Ollama)\n\n"
+                    "Resolve the embedding issue and rerun hydration."
+                ) from exc
             raise RuntimeError(
                 f"Embedding provider failed while processing table '{table}'. "
+                f"Error: {error_msg}\n\n"
                 "Resolve the embedding issue and rerun hydration."
             ) from exc
         ids = [record.vector_id for record in records]

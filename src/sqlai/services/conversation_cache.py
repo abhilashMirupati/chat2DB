@@ -9,6 +9,16 @@ from pathlib import Path
 from typing import Dict, List, Optional
 
 
+def _normalize_schema_name(schema: str) -> str:
+    """
+    Normalize schema name to lowercase for SQLite storage and retrieval.
+    This ensures consistent schema name handling regardless of case in user input.
+    """
+    if not schema:
+        return schema
+    return schema.lower().strip()
+
+
 class ConversationCache:
     """
     SQLite-backed cache of successful question/answer interactions.
@@ -46,6 +56,7 @@ class ConversationCache:
         summary: Optional[str] = None,
         chart: Optional[Dict[str, object]] = None,
     ) -> None:
+        schema = _normalize_schema_name(schema)
         payload_plan = json.dumps(plan or {}, ensure_ascii=False)
         payload_chart = json.dumps(chart or {}, ensure_ascii=False) if chart else None
         with self._lock:
@@ -68,6 +79,7 @@ class ConversationCache:
             self.conn.commit()
 
     def list_interactions(self, schema: str, limit: int = 20) -> List[Dict[str, object]]:
+        schema = _normalize_schema_name(schema)
         with self._lock:
             cursor = self.conn.execute(
                 """
@@ -122,6 +134,7 @@ class ConversationCache:
         Get recent questions for similarity checking.
         Returns questions with their SQL for semantic comparison.
         """
+        schema = _normalize_schema_name(schema)
         with self._lock:
             cursor = self.conn.execute(
                 """
