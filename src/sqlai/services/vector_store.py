@@ -14,7 +14,7 @@ except ImportError:  # pragma: no cover - handled dynamically when dependency mi
     ChromaClient = Any  # type: ignore[assignment]
     Collection = Any  # type: ignore[assignment]
 
-from sqlai.config import EmbeddingConfig, VectorStoreConfig
+from sqlai.config import EmbeddingConfig, VectorStoreConfig, load_limits_config
 from sqlai.services.graph_cache import GraphCache, GraphCardRecord
 from sqlai.utils.vector_store_utils import build_vector_store_namespace
 
@@ -139,10 +139,15 @@ class VectorStoreManager:
         self,
         schema: Optional[str] = None,
         *,
-        limit: int = 100_000,
+        limit: int | None = None,
     ) -> Dict[str, Set[str]]:
         """
         Return a mapping of table_name -> set(vector_id) currently stored in ChromaDB.
+        
+        Args:
+            schema: Optional schema filter. When provided, only vectors with matching
+                schema metadata are returned.
+            limit: Maximum number of records to process. If None, uses limits_config.vector_store_limit.
 
         Args:
             schema: Optional schema filter. When provided, only vectors with matching
@@ -152,6 +157,8 @@ class VectorStoreManager:
         """
         if not self.enabled:
             return {}
+        if limit is None:
+            limit = load_limits_config().vector_store_limit
         collection = self._ensure_collection()
         get_kwargs: Dict[str, Any] = {
             "include": ["metadatas"],

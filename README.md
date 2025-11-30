@@ -22,8 +22,10 @@ SQLAI is designed for enterprise teams who need trustworthy, self-healing SQL ge
 
 - **Graph-RAG context** from live schema introspection, cached in SQLite, embedded in Chroma.
 - **LangGraph workflow** with planner, pre-execution critic/repair, deterministic guardrails, post-execution critic/repair, and summariser.
-- **Streamlit UI** with saved profiles, connection testers, saved query replay, and detailed plan/SQL previews.
+- **Streamlit UI** with saved profiles, connection testers, saved query replay, table filtering, and detailed plan/SQL previews.
 - **Headless prewarm** script for production deployments so cold starts are fast.
+- **Robust error handling** for API errors (quota, payment), context length limits, and infinite loop protection.
+- **Privacy-first**: All telemetry disabled by default (PostHog, LangChain, Streamlit, OpenAI, HuggingFace).
 
 ---
 ## Architecture
@@ -149,16 +151,44 @@ SQLAI_VECTOR_PROVIDER=chroma
 # SQLAI_VECTOR_PATH=.cache/vector_store
 # SQLAI_VECTOR_COLLECTION=graph_cards
 
-# FK Expansion Configuration (Multi-hop traversal)
-SQLAI_FK_EXPANSION_MAX_DEPTH=3          # Maximum hop depth (1=direct only, 2=1-hop, 3=2-hop, etc.)
-SQLAI_FK_EXPANSION_MAX_TABLES=20        # Maximum additional tables to add via FK expansion
+# Centralized Limits Configuration (all configurable via SQLAI_LIMITS_ prefix)
+# Table Selection
+SQLAI_LIMITS_MAX_TABLES=6               # Max tables from vector search (before FK expansion)
+SQLAI_LIMITS_MAX_COLUMNS=               # Max columns in context (empty = no limit, include all)
+
+# FK Expansion (Multi-hop traversal)
+SQLAI_LIMITS_FK_EXPANSION_MAX_DEPTH=3   # Maximum hop depth (1=direct only, 2=1-hop, 3=2-hop, etc.)
+SQLAI_LIMITS_FK_EXPANSION_MAX_TABLES=20 # Maximum additional tables to add via FK expansion
+
+# Similarity Thresholds
+SQLAI_LIMITS_SIMILARITY_THRESHOLD_NO_FILTER=0.5    # When no filter active (better recall)
+SQLAI_LIMITS_SIMILARITY_THRESHOLD_WITH_FILTER=0.70 # When filter active (better precision)
+SQLAI_LIMITS_SIMILARITY_THRESHOLD_SIMILAR_QUESTIONS=0.75 # For detecting similar questions
+
+# Repair Iterations
+SQLAI_LIMITS_MAX_REPAIR_ITERATIONS=2    # Max intent + post-exec repair iterations (default: 2)
+
+# Other Limits
+SQLAI_LIMITS_MAX_TOP_VALUES=5          # Max top values in dataframe profiling
+SQLAI_LIMITS_RECENT_QUERIES_LIMIT=20   # Max recent queries from cache
+SQLAI_LIMITS_CONVERSATION_LIMIT=50     # Max conversation messages
+SQLAI_LIMITS_SAMPLE_QUERY_LIMIT=5      # Number of sample rows for previews
+SQLAI_LIMITS_VECTOR_STORE_LIMIT=1000   # Max records in vector store operations
+
+# Legacy FK Expansion Config (deprecated - use SQLAI_LIMITS_* above)
+# SQLAI_FK_EXPANSION_MAX_DEPTH=3
+# SQLAI_FK_EXPANSION_MAX_TABLES=20
 
 SQLAI_LOG_LEVEL=INFO
 SQLAI_BRAND_NAME=Silpa Analytics Lab
 # SQLAI_BRAND_LOGO_PATH=C:\path\to\logo.png
 ```
 
-Database, chat LLM, and embedding LLM settings are mandatory. `defog/*` models automatically route to the correct Hugging Face endpoint; others fall back to `https://router.huggingface.co/hf-inference`.
+**Notes:**
+- Database, chat LLM, and embedding LLM settings are mandatory.
+- `defog/*` models automatically route to the correct Hugging Face endpoint; others fall back to `https://router.huggingface.co/hf-inference`.
+- **Telemetry is disabled by default**: All analytics/telemetry (PostHog, LangChain, Streamlit, OpenAI, HuggingFace) are disabled to prevent SSL errors and ensure privacy. No data is sent to external services.
+- **Centralized limits**: All limits are now configurable via `SQLAI_LIMITS_*` environment variables. Legacy `SQLAI_FK_EXPANSION_*` variables are deprecated but still supported for backward compatibility.
 
 ---
 ## Prewarm & Runtime Workflow
@@ -219,11 +249,15 @@ Rendered cards are cached in `.cache/graph_cards.db` and **only table cards are 
 **Retrieval Process:**
 
 1. **Stage 1: Table Selection** (Semantic search on table cards only)
-   - Heuristic ranking: keyword matching on table/column names
-   - On-the-fly semantic similarity: embedding-based table ranking (fallback)
-   - Vector store search: queries ChromaDB with `where={"card_type": "table"}`
-   - Merge results: combines heuristic + semantic + vector scores
-   - Select top-K tables (default: 6)
+   - **When NO filter is active:**
+     - Vector store search: queries ChromaDB with `where={"card_type": "table"}` across ALL tables
+     - Similarity threshold: 0.5 (better recall - includes more tables)
+     - Select top-K tables (default: 6, configurable via `SQLAI_LIMITS_MAX_TABLES`)
+   - **When filter IS active:**
+     - Vector search is SKIPPED entirely
+     - Filter tables are directly added as MANDATORY (always included)
+     - Similarity threshold: 0.70 (better precision - only highly relevant from filtered set)
+     - Question mentions: Tables explicitly mentioned in query are detected and added
 
 2. **Stage 2: Multi-Hop FK Expansion** (BFS traversal)
    - Recursively expands table selection to include FK-connected chains
@@ -250,17 +284,26 @@ Rendered cards are cached in `.cache/graph_cards.db` and **only table cards are 
 
 ### Table Filtering (Optional)
 
-For large databases (500+ tables), you can optionally filter vector search to specific tables to improve performance and accuracy.
+For large databases (500+ tables), you can optionally filter to specific tables to improve performance and accuracy.
 
 **How it works:**
-- **Vector search filtering**: When tables are selected via the UI filter, vector search only queries embeddings for those tables (faster search)
-- **FK expansion preserved**: Foreign key expansion still uses the full graph context, ensuring join accuracy even if related tables weren't explicitly selected
-- **Optional feature**: If no tables are selected, the system uses all tables (backward compatible)
+- **Selected tables are MANDATORY**: Always included in context (even if similarity score is low)
+- **Vector search is SKIPPED**: When filter is active, vector search is completely skipped. Filter tables are directly added as mandatory.
+- **FK expansion is UNRESTRICTED**: Foreign key expansion can add related tables outside the filter to ensure complete join paths
+- **Question mentions are DETECTED**: Tables explicitly mentioned in the question are automatically added
+- **Similarity threshold increases**: 0.70 (with filter) vs 0.5 (no filter) for better precision
+- **Optional feature**: If no tables are selected, the system uses all tables with vector search (backward compatible)
 
 **When to use:**
 - Databases with 500+ tables where vector search becomes slow
 - Domain-specific queries where you know which tables are relevant (e.g., "Sales Tables", "HR Tables")
-- Improving accuracy by focusing vector search on relevant schema subsets
+- Improving accuracy by focusing on relevant schema subsets
+- Performance optimization: Skipping vector search entirely when you know the tables
+
+**When NOT to use:**
+- Exploring unknown schemas - let the system search all tables
+- Small databases (< 50 tables) - filter overhead not worth it
+- Unsure which tables are relevant - better to search broadly first
 
 **UI Features:**
 - Collapsible table filter panel (default collapsed) in main UI
@@ -268,6 +311,8 @@ For large databases (500+ tables), you can optionally filter vector search to sp
 - Multi-select widget for table selection
 - Group management: Create named groups (e.g., "Sales Tables", "HR Tables") to save and reuse table selections
 - Groups persist in session state across queries
+- "Save Current Selection to Group" button to update existing groups
+- "Delete Group" button to remove groups
 
 **Example workflow:**
 1. Initialize agent with database connection
@@ -275,7 +320,7 @@ For large databases (500+ tables), you can optionally filter vector search to sp
 3. Create a group (e.g., "Sales Tables")
 4. Search and select relevant tables (e.g., `orders`, `customers`, `products`)
 5. Save selection to group
-6. Run queries - vector search will only search selected tables, but FK expansion will still include related tables for accuracy
+6. Run queries - filter tables are mandatory, vector search is skipped, FK expansion may add related tables outside filter
    - Includes both directions (outgoing and incoming FKs)
    - Ensures complete join paths are available to LLM
 
@@ -357,11 +402,14 @@ This structured format ensures the LLM has complete schema information, sample v
 
 ### Guarded execution
 - **SQLGlot transpilation** (mandatory): Automatically converts SQL to the target database dialect if LLM generates wrong-dialect SQL. Supports Oracle, PostgreSQL, MySQL, SQL Server, SQLite, Snowflake, BigQuery, and more.
-- `validate_sql` enforces row caps, read-only queries, literal alignment, and dialect normalization.
+- `validate_sql` enforces row caps, read-only queries, literal alignment, dialect normalization, and prevents destructive operations (DROP, TRUNCATE, DELETE without WHERE, etc.).
 - `repair_sql` patches missing limits, metadata rewrites, and dialect quirks.
-- **Intent critic** (pre-execution) ensures SQL answers the question before hitting the DB (max 5 iterations).
-- **Post critic** inspects runtime errors, provides fixes, and retries (max 3 iterations).
+- **Intent critic** (pre-execution) ensures SQL answers the question before hitting the DB. Configurable max iterations (default: 2, set via `SQLAI_LIMITS_MAX_REPAIR_ITERATIONS`).
+- **Post critic** inspects runtime errors, provides fixes, and retries. Configurable max iterations (default: 2, set via `SQLAI_LIMITS_MAX_REPAIR_ITERATIONS`).
+- **Infinite loop protection**: All repair loops respect max attempts and properly exit with error messages when limits are reached.
 - **Robust JSON parsing** for planner, intent critic/repair, and post critic/repair: malformed JSON (e.g., trailing commas) is auto-fixed so critique and repair always run.
+- **API error handling**: Detects and handles LLM API errors (402 Payment Required, quota exceeded, etc.) with user-friendly error messages and guidance.
+- **Context length error handling**: When prompt exceeds model's context window, provides detailed error message with token counts and guidance to switch to a larger model (does NOT automatically reduce tokens).
 - **Schema-aware SQL normalization (universal):**
   - Column-name repair: if a referenced column does not exist, map to the closest valid column from the joined tables (e.g., `result` → `status`) using string similarity against the GraphContext.
   - Alias remap: if a qualified column belongs to a different joined table, re-qualify automatically (e.g., `tc.status` → `e.status` when `status` exists only on `executions`).
@@ -397,10 +445,13 @@ UI visibility:
 | `Unknown tables referenced` | Schema cache stale; rerun prewarm or initialise after selecting schema. |
 | `ORA-00904` / `ORA-00933` | Dialect mismatch; guardrail output shows patched SQL. |
 | Hugging Face `401/404/410` | Token lacks access or wrong router; accept license, ensure `.env` base URL correct. |
+| `402 Payment Required` / Quota exceeded | LLM API quota exceeded; upgrade plan or change model in sidebar. Error message provides guidance. |
+| Context length exceeded | Prompt too large for model; switch to model with larger context window (error message shows token counts). |
 | Metadata hydration slow | Run prewarm; caches reduce cold-start time dramatically. |
 | Retrieval misses tables | Embedding provider not configured/tested; run sidebar "Test embedding connection". |
-| Missing FK-referenced tables | FK expansion should auto-include them via multi-hop traversal; check logs for expansion details. If limit reached, increase `SQLAI_FK_EXPANSION_MAX_DEPTH` (default: 3) or `SQLAI_FK_EXPANSION_MAX_TABLES` (default: 20) in `.env`. |
+| Missing FK-referenced tables | FK expansion should auto-include them via multi-hop traversal; check logs for expansion details. If limit reached, increase `SQLAI_LIMITS_FK_EXPANSION_MAX_DEPTH` (default: 3) or `SQLAI_LIMITS_FK_EXPANSION_MAX_TABLES` (default: 20) in `.env`. |
 | No columns found for selected tables | Check table name matching (case-insensitive); verify graph_cards.db has columns for those tables. |
+| Infinite loop / GraphRecursionError | Should not occur; max repair iterations are enforced (default: 2). If seen, check logs for execution_error state. |
 
 ### Production deployment checklist
 1. **Secrets management** – inject DB URLs/API keys from Vault/Key Vault/Secrets Manager.

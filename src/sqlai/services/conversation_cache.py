@@ -8,6 +8,8 @@ import time
 from pathlib import Path
 from typing import Dict, List, Optional
 
+from sqlai.config import load_limits_config
+
 
 def _normalize_schema_name(schema: str) -> str:
     """
@@ -78,7 +80,9 @@ class ConversationCache:
             )
             self.conn.commit()
 
-    def list_interactions(self, schema: str, limit: int = 20) -> List[Dict[str, object]]:
+    def list_interactions(self, schema: str, limit: int | None = None) -> List[Dict[str, object]]:
+        if limit is None:
+            limit = load_limits_config().recent_queries_limit
         schema = _normalize_schema_name(schema)
         with self._lock:
             cursor = self.conn.execute(
@@ -129,7 +133,9 @@ class ConversationCache:
             "created_at": row[7],
         }
 
-    def get_recent_questions(self, schema: str, limit: int = 20) -> List[Dict[str, object]]:
+    def get_recent_questions(self, schema: str, limit: int | None = None) -> List[Dict[str, object]]:
+        if limit is None:
+            limit = load_limits_config().recent_queries_limit
         """
         Get recent questions for similarity checking.
         Returns questions with their SQL for semantic comparison.

@@ -2,8 +2,30 @@
 
 from __future__ import annotations
 
-import json
 import os
+
+# Disable all analytics BEFORE any other imports (prevents PostHog SSL errors)
+os.environ["LANGCHAIN_TELEMETRY"] = "false"
+os.environ["LANGCHAIN_TRACING_V2"] = "false"
+os.environ["LANGCHAIN_API_KEY"] = ""
+os.environ["LLAMA_INDEX_ANALYTICS_ENABLED"] = "false"
+os.environ["POSTHOG_DISABLE"] = "true"
+os.environ["POSTHOG_DISABLED"] = "true"
+os.environ["OPENAI_TELEMETRY_OPTOUT"] = "1"
+os.environ["HF_HUB_DISABLE_TELEMETRY"] = "1"
+os.environ["STREAMLIT_BROWSER_GATHER_USAGE_STATS"] = "false"
+os.environ["STREAMLIT_SERVER_HEADLESS"] = "true"
+os.environ["STREAMLIT_TELEMETRY"] = "false"
+os.environ["DO_NOT_TRACK"] = "1"
+
+# Hard monkeypatch PostHog so it CANNOT send anything
+try:
+    import posthog
+    posthog.disabled = True
+except Exception:
+    pass
+
+import json
 
 from dotenv import load_dotenv
 
@@ -1278,8 +1300,9 @@ def render_table_filter(service: AnalyticsService) -> None:
     
     with st.expander("🔍 Filter Tables (Optional)", expanded=st.session_state.get("table_filter_expanded", False)):
         st.caption(
-            "💡 **Tip:** Select specific tables to speed up vector search for large databases. "
-            "FK relationships will still be expanded for accuracy."
+            "💡 **Tip:** Select specific tables to skip vector search and speed up queries for large databases. "
+            "**Selected tables are mandatory** (always included in context, no vector search needed). "
+            "Tables mentioned in your question and FK-related tables will still be added automatically (may include tables outside filter) to ensure join accuracy."
         )
         
         # Group Management Section
@@ -1296,11 +1319,21 @@ def render_table_filter(service: AnalyticsService) -> None:
             options=group_options,
             index=group_index,
             help="Groups allow you to save and reuse table selections",
+            key="table_filter_group_selectbox",
         )
         
-        # Handle group selection
+        # Track previous group to detect changes
+        prev_group_key = "prev_table_filter_group"
+        prev_group = st.session_state.get(prev_group_key)
+        
+        # Handle group selection - MUST happen before reading selected_tables for multiselect
+        group_changed = False
         if selected_group_option == "(No group)":
-            st.session_state["active_table_filter_group"] = None
+            if st.session_state.get("active_table_filter_group") is not None:
+                st.session_state["active_table_filter_group"] = None
+                st.session_state["selected_tables_for_query"] = []
+                st.session_state[prev_group_key] = None
+                group_changed = True
         elif selected_group_option == "(Create new group)":
             new_group_name = st.text_input(
                 "New group name",
@@ -1313,14 +1346,26 @@ def render_table_filter(service: AnalyticsService) -> None:
                     groups[new_group_name.strip()] = []
                     st.session_state["table_filter_groups"] = groups
                     st.session_state["active_table_filter_group"] = new_group_name.strip()
-                    st.rerun()
+                    st.session_state["selected_tables_for_query"] = []
+                    st.session_state[prev_group_key] = new_group_name.strip()
+                    group_changed = True
         else:
             # Existing group selected
-            st.session_state["active_table_filter_group"] = selected_group_option
-            # Load group's tables if different from current selection
-            if groups[selected_group_option] != selected_tables:
+            # Check if group changed
+            if prev_group != selected_group_option:
+                # Group changed - load its tables
+                st.session_state["active_table_filter_group"] = selected_group_option
                 st.session_state["selected_tables_for_query"] = groups[selected_group_option].copy()
-                st.rerun()
+                st.session_state[prev_group_key] = selected_group_option
+                group_changed = True
+        
+        # Rerun if group changed
+        if group_changed:
+            st.rerun()
+        
+        # Re-read active group and selected tables after group selection logic
+        active_group = st.session_state.get("active_table_filter_group")
+        selected_tables = st.session_state.get("selected_tables_for_query", [])
         
         st.divider()
         
@@ -1342,43 +1387,73 @@ def render_table_filter(service: AnalyticsService) -> None:
             filtered_table_names = [t for t in table_names if search_lower in t.lower()]
         
         # Multi-select widget
+        # Use dynamic key based on active group to force widget reset when group changes
+        multiselect_key = f"table_filter_multiselect_{active_group or 'none'}"
+        
+        # Initialize multiselect key with selected_tables if it doesn't exist
+        # When group changes, the key changes (new group name), so this will initialize with new group's tables
+        if multiselect_key not in st.session_state:
+            st.session_state[multiselect_key] = selected_tables.copy()
+        
         selected_tables_new = st.multiselect(
             "Select tables to filter",
             options=filtered_table_names,
-            default=selected_tables,
-            help=f"Select tables to limit vector search. Leave empty to search all {len(table_names)} tables.",
+            default=st.session_state.get(multiselect_key, selected_tables),
+            key=multiselect_key,
+            help=f"Select tables to skip vector search. Leave empty to search all {len(table_names)} tables.",
         )
         
         # Update session state
         st.session_state["selected_tables_for_query"] = selected_tables_new
         
         # Group actions (only if group is selected) - moved AFTER multiselect so we use current selection
-        if active_group and active_group in groups:
+        # Show buttons for ANY active group (user can update it by saving)
+        active_group_updated = st.session_state.get("active_table_filter_group")
+        if active_group_updated and active_group_updated in groups:
+            # Check if current selection matches the group
+            group_tables = groups.get(active_group_updated, [])
+            selection_matches = set(selected_tables_new) == set(group_tables)
+            
+            if not selection_matches:
+                st.info(f"ℹ️ Current selection differs from group '{active_group_updated}'. Click 'Save' to update the group.")
+            
             col1, col2 = st.columns(2)
             with col1:
-                if st.button("💾 Save Current Selection to Group", type="secondary"):
+                button_label = "💾 Update Group" if not selection_matches else "💾 Save Current Selection to Group"
+                if st.button(button_label, type="secondary"):
                     # Use selected_tables_new (current multiselect value) instead of selected_tables (old value)
-                    groups[active_group] = selected_tables_new.copy()
+                    groups[active_group_updated] = selected_tables_new.copy()
                     st.session_state["table_filter_groups"] = groups
-                    st.success(f"Saved {len(selected_tables_new)} tables to group '{active_group}'")
+                    st.session_state["prev_table_filter_group"] = active_group_updated
+                    st.success(f"Saved {len(selected_tables_new)} tables to group '{active_group_updated}'")
+                    st.rerun()
             with col2:
                 if st.button("🗑️ Delete Group", type="secondary"):
-                    del groups[active_group]
+                    del groups[active_group_updated]
                     st.session_state["table_filter_groups"] = groups
-                    if st.session_state["active_table_filter_group"] == active_group:
+                    if st.session_state["active_table_filter_group"] == active_group_updated:
                         st.session_state["active_table_filter_group"] = None
+                        st.session_state["prev_table_filter_group"] = None
                     st.rerun()
         
         # Display selection info
         if selected_tables_new:
-            st.info(f"✅ **{len(selected_tables_new)} of {len(table_names)} tables selected.** Vector search will only search these tables.")
+            st.info(
+                f"✅ **{len(selected_tables_new)} of {len(table_names)} tables selected (MANDATORY).**\n\n"
+                f"• Selected tables are **always included** in context (no vector search needed)\n"
+                f"• Vector search is **skipped** when filter is active (faster queries)\n"
+                f"• FK expansion may add related tables outside filter for join accuracy"
+            )
         else:
-            st.info(f"ℹ️ **No tables selected.** Vector search will use all {len(table_names)} tables.")
+            st.info(
+                f"ℹ️ **No tables selected.** Vector search will use all {len(table_names)} tables with threshold **0.50**."
+            )
         
         # Info message about FK expansion
         st.caption(
-            "📌 **Note:** When tables are selected, vector search is filtered to these tables only. "
-            "FK relationships will still be expanded automatically to ensure join accuracy."
+            "📌 **How it works:** Selected tables are **mandatory** and always included. "
+            "Vector search is **skipped** when filter is active (selected tables are added directly). "
+            "Tables mentioned in your question and multi-hop FK expansion automatically add related tables (even outside filter) to ensure complete join paths and SQL accuracy."
         )
 
 

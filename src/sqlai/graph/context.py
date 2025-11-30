@@ -7,6 +7,7 @@ from __future__ import annotations
 from dataclasses import dataclass
 from typing import Dict, Iterable, List, Optional, Sequence, Set, Tuple
 
+from sqlai.config import load_limits_config
 from sqlai.database.schema_introspector import ColumnMetadata, ForeignKeyDetail, TableSummary
 
 
@@ -117,8 +118,9 @@ class GraphContext:
     ) -> Dict[str, str]:
         # Use provided tables/columns/relationships if given, otherwise fall back to ranking
         # Note: Check for None explicitly (not just truthiness) to allow empty lists
-        selected_tables = tables if tables is not None else self.rank_tables(question, max_cards=6)
-        selected_columns = columns if columns is not None else self.rank_columns(question, selected_tables, max_cards=10)
+        limits_config = load_limits_config()
+        selected_tables = tables if tables is not None else self.rank_tables(question, max_cards=limits_config.max_tables)
+        selected_columns = columns if columns is not None else self.rank_columns(question, selected_tables, max_cards=limits_config.max_tables * 2)
         selected_relationships = relationships if relationships is not None else self.relationships_for_tables(selected_tables)
 
         schema_names = ", ".join(sorted(filter(None, self.schemas))) or "(not specified)"

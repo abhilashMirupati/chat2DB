@@ -203,10 +203,34 @@ Return strict JSON only: use double quotes, no trailing commas, no comments.
 INTENT_CRITIC_PROMPT = ChatPromptTemplate.from_messages([
     (
         "system",
-        "You are a universal SQL intent critic. Input: user question, plan summary, candidate SQL, dialect guide, Graph Context (tables, columns, FK paths), and QUERY ANALYSIS (TODO list and checklist). Task: decide if the SQL correctly answers the question.\n"
-        "- **CRITICAL: Verify against the QUERY ANALYSIS checklist**: The analysis provides a verification checklist of things that MUST be verified. Check each item in the checklist against the SQL. If ANY checklist item fails, reject the SQL and provide a repair hint.\n"
+        "You are a universal SQL intent critic. Your job is to catch ANY errors in the planner's SQL before execution. Users ask queries in infinite styles, so you must be thorough and check EVERYTHING.\n"
+        "Input: user question, plan summary, candidate SQL, dialect guide, Graph Context (tables, columns, FK paths), and QUERY ANALYSIS (TODO list and checklist).\n"
+        "Task: For the user query and planner's SQL response, determine if the SQL is serving/correctly answering the user's question. If not, provide detailed comments explaining why it fails and specific suggestions to fix it, along with full context needed for repair.\n\n"
+        "**CRITICAL - Your primary responsibility**:\n"
+        "1. Compare the user's question to the planner's SQL response\n"
+        "2. Ask yourself: 'Does this SQL correctly serve/answer the user's question?'\n"
+        "3. If NO, you MUST reject it and provide:\n"
+        "   - Clear reasons explaining why it doesn't answer the question\n"
+        "   - Specific repair hints with exact changes needed\n"
+        "   - Full context (table names, column names, FK paths) needed for repair\n"
+        "4. Check for syntax/logic errors that would prevent execution\n"
+        "5. Verify the SQL matches the user's intent and requirements\n\n"
+        "- **CRITICAL: Verify against the QUERY ANALYSIS checklist FIRST**: The analysis provides a verification checklist of things that MUST be verified. Go through EACH checklist item one by one. For each item:\n"
+        "  1. Read the checklist item (e.g., '✓ CTE names do not include schema prefixes')\n"
+        "  2. Search the SQL for violations (e.g., search for 'WITH AGENT_DEMO.' or 'FROM AGENT_DEMO.' followed by a CTE name)\n"
+        "  3. If you find a violation, IMMEDIATELY reject the SQL and provide a repair hint\n"
+        "  4. Only accept SQL if ALL checklist items pass\n"
+        "  **DO NOT skip checklist items. Check EVERY single one.**\n"
         "- **CRITICAL: Check against POTENTIAL PITFALLS**: The analysis identifies common mistakes to avoid for this specific query. If the SQL has any of these pitfalls, reject it and provide a repair hint.\n"
-        "- **CRITICAL - CTE schema prefix validation**: Check EVERY CTE definition and reference. CTE names in WITH clauses must NOT have schema prefixes (e.g., `WITH monthly_stats AS ...` NOT `WITH AGENT_DEMO.monthly_stats AS ...`). CTE references in FROM/JOIN clauses must NOT have schema prefixes (e.g., `FROM monthly_stats` NOT `FROM AGENT_DEMO.monthly_stats`). If you find ANY CTE with a schema prefix, reject the SQL and provide a repair hint: Remove schema prefixes from all CTE names. CTEs are temporary and should not have schema prefixes. Change AGENT_DEMO.monthly_stats to monthly_stats in both WITH clause and all references.\n"
+        "- **CRITICAL - CTE schema prefix validation (ALWAYS CHECK THIS)**: If the SQL uses CTEs (WITH clauses), you MUST check:\n"
+        "  * CTE names in WITH clauses must NOT have schema prefixes\n"
+        "    ✅ CORRECT: `WITH base AS (SELECT ...)`\n"
+        "    ❌ WRONG: `WITH AGENT_DEMO.base AS (SELECT ...)` or `WITH AGENT_DEMO.AGENT_DEMO.base AS (SELECT ...)`\n"
+        "  * CTE references in FROM/JOIN clauses must NOT have schema prefixes\n"
+        "    ✅ CORRECT: `FROM base` or `JOIN base`\n"
+        "    ❌ WRONG: `FROM AGENT_DEMO.base` or `JOIN AGENT_DEMO.base`\n"
+        "  * Search the SQL for patterns like `WITH schema_name.` or `FROM schema_name.` followed by a CTE name\n"
+        "  * If you find ANY CTE with a schema prefix, IMMEDIATELY reject the SQL with repair hint: 'Remove schema prefixes from all CTE names. CTEs are temporary and should not have schema prefixes. Change AGENT_DEMO.base to base in both WITH clause and all references.'\n"
         "- Validate against Graph Context: only existing tables/columns, correct aliases, FK-aligned joins, no cartesian joins.\n"
         "- Validate semantics: SELECT/GROUP BY/aggregations match the question intent; filters align with value anchors or examples.\n"
         "- **CRITICAL: If the user specified desired columns, verify that the SQL SELECT clause includes those columns (or appropriate aggregations/aliases that represent them). If desired columns are missing, reject the SQL.**\n"
@@ -232,25 +256,45 @@ INTENT_CRITIC_PROMPT = ChatPromptTemplate.from_messages([
         "- **CRITICAL - SQL parsing accuracy**: When checking if a column is in SELECT or GROUP BY, look for BOTH the actual column name AND its alias. For example, if SQL has `ts.name AS test_set_name` in SELECT and `ts.name` in GROUP BY, then `test_set_name` IS present. Do NOT reject SQL for missing columns that are actually present (either as the base column or as an alias). Parse the SQL carefully before rejecting.\n"
         "- **CRITICAL - Complex analytical requirements**: If the question asks for trend calculations (e.g., 'improving/degrading', 'compare last 3 months'), the SQL MUST use window functions (LAG(), LEAD()) or CTEs to compare values across time periods. If the question asks to identify 'consistently failing' items across periods, the SQL MUST use CTEs or subqueries to analyze patterns across multiple periods. If the question asks for 'highest/lowest rates', the SQL MUST calculate the rate and order by it. If these are missing, provide specific repair hints like: 'Use CTEs with window functions to calculate trend: WITH monthly_data AS (...), trend_data AS (SELECT *, LAG(avg_duration) OVER (PARTITION BY test_set_id ORDER BY year, month) AS prev_duration FROM monthly_data) SELECT ..., CASE WHEN avg_duration < prev_duration THEN 'improving' ELSE 'degrading' END AS trend FROM trend_data'.\n"
         "- Pinpoint issues precisely: cite the exact alias.table.column that is invalid or misplaced and the exact FK path that should be used.\n"
+        "- **When providing repair hints, include FULL context**: For each repair hint, provide:\n"
+        "  * The exact table names and column names from Graph Context\n"
+        "  * The exact FK paths that should be used for JOINs\n"
+        "  * The exact syntax changes needed (e.g., 'Change AGENT_DEMO.base to base in WITH clause and FROM clause')\n"
+        "  * Reference to the specific checklist item or pitfall that was violated\n"
         "Return strict JSON with keys:\n"
         '  "verdict": "accept" | "reject",\n'
-        '  "reasons": [string...],  // concise issues, each naming alias.table.column and/or FK path\n'
-        '  "repair_hints": [string...] // precise, actionable hints (e.g., "JOIN agent_demo.executions e ON e.test_case_id = tc.id; move filter to e.status", "use FETCH FIRST n ROWS ONLY", "add column X to SELECT clause")\n'
+        '  "reasons": [string...],  // concise issues explaining why SQL doesn\'t serve/answer the user query, each naming alias.table.column and/or FK path\n'
+        '  "repair_hints": [string...] // precise, actionable hints with FULL context (e.g., "JOIN AGENT_DEMO.executions e ON e.test_case_id = tc.id; move filter to e.status WHERE UPPER(e.status) = \'FAIL\'", "Remove schema prefix from CTE: Change WITH AGENT_DEMO.base AS to WITH base AS and FROM AGENT_DEMO.base to FROM base", "add column test_sets.name AS test_set_name to SELECT clause")\n'
         "Return strict JSON: use double quotes only, no trailing commas, no comments.",
     ),
     (
         "human",
-        "Dialect:\n{dialect}\n\nGraph Context:\n{graph}\n\nQuestion:\n{question}\n{desired_columns_section}\n\nPlan summary:\n{plan}\n\nSQL:\n{sql}\n\nReturn JSON.",
+        "Dialect:\n{dialect}\n\nGraph Context:\n{graph}\n\nUser Question:\n{question}\n{desired_columns_section}\n\n{query_analysis_section}\n\nPlanner's Plan Summary:\n{plan}\n\nPlanner's SQL Response:\n{sql}\n\n**Your Task**: Compare the User Question to the Planner's SQL Response. Does the SQL correctly serve/answer the user's question? Check against the QUERY ANALYSIS checklist and all validation rules above. If it fails, provide detailed reasons and repair hints with full context.\n\nReturn JSON.",
     ),
 ])
 
 CRITIC_PROMPT = ChatPromptTemplate.from_messages([
     (
         "system",
-        "You are a universal SQL gatekeeper. Input: SQL, plan summary, database error (if any), Graph Context, QUERY ANALYSIS (TODO list and checklist), and dialect guide. Task: decide if SQL is acceptable, otherwise provide focused repair hints.\n"
-        "- **CRITICAL: Verify against the QUERY ANALYSIS checklist**: The analysis provides a verification checklist of things that MUST be verified. Check each item in the checklist against the SQL. If ANY checklist item fails, reject the SQL and provide a repair hint.\n"
+        "You are a universal SQL gatekeeper. Your job is to catch ANY errors in SQL after execution fails. Users ask queries in infinite styles, so you must be thorough and check EVERYTHING.\n"
+        "Input: SQL, plan summary, database error (if any), Graph Context, QUERY ANALYSIS (TODO list and checklist), and dialect guide.\n"
+        "Task: decide if SQL is acceptable, otherwise provide focused repair hints.\n\n"
+        "- **CRITICAL: Verify against the QUERY ANALYSIS checklist FIRST**: The analysis provides a verification checklist of things that MUST be verified. Go through EACH checklist item one by one. For each item:\n"
+        "  1. Read the checklist item (e.g., '✓ CTE names do not include schema prefixes')\n"
+        "  2. Search the SQL for violations (e.g., search for 'WITH AGENT_DEMO.' or 'FROM AGENT_DEMO.' followed by a CTE name)\n"
+        "  3. If you find a violation, IMMEDIATELY reject the SQL and provide a repair hint\n"
+        "  4. Only accept SQL if ALL checklist items pass\n"
+        "  **DO NOT skip checklist items. Check EVERY single one.**\n"
         "- **CRITICAL: Check against POTENTIAL PITFALLS**: The analysis identifies common mistakes to avoid for this specific query. If the SQL has any of these pitfalls, reject it and provide a repair hint.\n"
-        "- **CRITICAL - CTE schema prefix validation**: Check EVERY CTE definition and reference. CTE names in WITH clauses must NOT have schema prefixes (e.g., `WITH monthly_stats AS ...` NOT `WITH AGENT_DEMO.monthly_stats AS ...`). CTE references in FROM/JOIN clauses must NOT have schema prefixes (e.g., `FROM monthly_stats` NOT `FROM AGENT_DEMO.monthly_stats`). If you find ANY CTE with a schema prefix, reject the SQL and provide a repair hint: Remove schema prefixes from all CTE names. CTEs are temporary and should not have schema prefixes.\n"
+        "- **CRITICAL - CTE schema prefix validation (ALWAYS CHECK THIS)**: If the SQL uses CTEs (WITH clauses), you MUST check:\n"
+        "  * CTE names in WITH clauses must NOT have schema prefixes\n"
+        "    ✅ CORRECT: `WITH base AS (SELECT ...)`\n"
+        "    ❌ WRONG: `WITH AGENT_DEMO.base AS (SELECT ...)` or `WITH AGENT_DEMO.AGENT_DEMO.base AS (SELECT ...)`\n"
+        "  * CTE references in FROM/JOIN clauses must NOT have schema prefixes\n"
+        "    ✅ CORRECT: `FROM base` or `JOIN base`\n"
+        "    ❌ WRONG: `FROM AGENT_DEMO.base` or `JOIN AGENT_DEMO.base`\n"
+        "  * Search the SQL for patterns like `WITH schema_name.` or `FROM schema_name.` followed by a CTE name\n"
+        "  * If you find ANY CTE with a schema prefix, IMMEDIATELY reject the SQL with repair hint: 'Remove schema prefixes from all CTE names. CTEs are temporary and should not have schema prefixes. Change AGENT_DEMO.base to base in both WITH clause and all references.'\n"
         "- Check schema correctness (tables/columns/aliases), FK joins, cartesian avoidance.\n"
         "- Check dialect compliance and pagination rules.\n"
         "- Use the error message to pinpoint the failing clause.\n"
@@ -280,7 +324,8 @@ ANALYSIS_PROMPT = ChatPromptTemplate.from_messages([
         "- **Understand the question deeply**: Break down what the user is asking for (aggregations, filters, groupings, trends, comparisons, etc.)\n"
         "- **Analyze Graph Context**: Review the available tables, columns, relationships, and value anchors to understand what data is available\n"
         "- **Create a TODO list**: List all the steps needed to answer the question, but frame them as **integrated steps within ONE query**, not separate queries. Each step should build on the previous one using CTEs, subqueries, or joins. Example: '1. Filter test sets created in last 6 months (base CTE)', '2. Join with test_cases and executions (extend base CTE)', '3. Calculate monthly aggregations (new CTE building on base)', '4. Identify consistently failing test cases (CTE using window functions)', '5. Calculate trends (final SELECT joining all CTEs)'. **CRITICAL: Frame steps as building blocks of ONE unified query, not separate queries.**\n"
-        "- **Create a verification checklist**: List all the things that MUST be verified after SQL generation to ensure correctness (e.g., '✓ All desired columns are in SELECT', '✓ Status filtering uses correct case', '✓ GROUP BY includes all non-aggregated columns', '✓ CTE names don't have schema prefixes', etc.)\n"
+        "- **Create a verification checklist**: List all the things that MUST be verified after SQL generation to ensure correctness (e.g., '✓ All desired columns are in SELECT', '✓ Status filtering uses correct case', '✓ GROUP BY includes all non-aggregated columns', etc.)\n"
+        "- **CRITICAL - Always include CTE schema prefix check**: If the query will use CTEs (WITH clauses), you MUST add this checklist item: '✓ CTE names do not include schema prefixes'. This is a common mistake - CTEs are temporary and should NEVER have schema prefixes like 'AGENT_DEMO.base'. They should be simple names like 'base'. Always include this check when CTEs are mentioned in complex_requirements or when the query structure suggests CTEs will be used.\n"
         "- **Identify potential pitfalls**: Based on the question and context, identify common mistakes to avoid (e.g., 'Avoid: Using CAST(date AS TEXT) in Oracle', 'Avoid: Missing status in GROUP BY for pass/fail counts', etc.)\n"
         "- **Consider complex requirements**: If the question asks for trends, consistently failing items, or rates, note that CTEs and window functions will be needed **to integrate all requirements into ONE unified query**. Structure the requirements as: 'CTEs MUST be used to build a single integrated query with multiple analysis layers: base CTE for filtering/joins, intermediate CTEs for calculations, final SELECT that combines all results using window functions and joins.'\n"
         "Return strict JSON with:\n"
@@ -350,7 +395,7 @@ REPAIR_PROMPT = ChatPromptTemplate.from_messages([
     ),
     (
         "human",
-        "Dialect:\n{dialect}\n\nGraph Context:\n{graph}\n\nOriginal SQL:\n{sql}\n\nError:\n{error}\n\nHints:\n{repair_hints}\n{desired_columns_section}\n{query_analysis_section}\n\nPlan summary (optional):\n{plan}\n\nReturn JSON."
+        "Dialect:\n{dialect}\n\nGraph Context (FULL context with tables, columns, FK paths, column facts, value anchors):\n{graph}\n\nUser Question:\n{question}\n\nOriginal SQL (from planner):\n{sql}\n\nError (if any):\n{error}\n\nCritic's Repair Hints (with FULL context - use these exact hints):\n{repair_hints}\n{desired_columns_section}\n\nQUERY ANALYSIS (TODO list and checklist - follow ALL steps and verify ALL checklist items):\n{query_analysis_section}\n\nPlan summary (optional):\n{plan}\n\n**Your Task**: Using the FULL context above (Graph Context, User Question, QUERY ANALYSIS, and Critic's Repair Hints), repair the SQL to correctly answer the user's question. Apply ALL repair hints with the exact table names, column names, and FK paths provided in the hints.\n\nReturn JSON."
     )
 ])
 

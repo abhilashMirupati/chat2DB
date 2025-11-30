@@ -34,6 +34,28 @@ Alternatively, add the same key/value pairs to the project `.env` file.
 from __future__ import annotations
 
 import os
+
+# Disable all analytics BEFORE any other imports (prevents PostHog SSL errors)
+os.environ["LANGCHAIN_TELEMETRY"] = "false"
+os.environ["LANGCHAIN_TRACING_V2"] = "false"
+os.environ["LANGCHAIN_API_KEY"] = ""
+os.environ["LLAMA_INDEX_ANALYTICS_ENABLED"] = "false"
+os.environ["POSTHOG_DISABLE"] = "true"
+os.environ["POSTHOG_DISABLED"] = "true"
+os.environ["OPENAI_TELEMETRY_OPTOUT"] = "1"
+os.environ["HF_HUB_DISABLE_TELEMETRY"] = "1"
+os.environ["STREAMLIT_BROWSER_GATHER_USAGE_STATS"] = "false"
+os.environ["STREAMLIT_SERVER_HEADLESS"] = "true"
+os.environ["STREAMLIT_TELEMETRY"] = "false"
+os.environ["DO_NOT_TRACK"] = "1"
+
+# Hard monkeypatch PostHog so it CANNOT send anything
+try:
+    import posthog
+    posthog.disabled = True
+except Exception:
+    pass
+
 import warnings
 
 from dotenv import load_dotenv

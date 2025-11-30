@@ -12,7 +12,7 @@ import requests
 import os
 from huggingface_hub import InferenceClient
 
-from sqlai.config import EmbeddingConfig
+from sqlai.config import EmbeddingConfig, load_limits_config
 from sqlai.graph.context import ColumnCard, GraphContext, RelationshipCard, TableCard
 from sqlai.services.vector_store import VectorStoreManager
 from sqlai.utils.logging import get_logger
@@ -136,6 +136,7 @@ class SemanticRetriever:
         self.config = config
         self.provider: Optional[_SimilarityProvider] = None
         self.vector_store = vector_store
+        self.limits_config = load_limits_config()
         if self.config.provider == "huggingface" and self.config.model and self.config.api_key:
             self.provider = _HuggingFaceSimilarity(
                 model=self.config.model,
@@ -167,50 +168,115 @@ class SemanticRetriever:
         LOGGER.info("GRAPH CARD RETRIEVAL - Starting selection for query: %s", question)
         LOGGER.info("=" * 80)
         
-        # Using only vector search (embeddings are pre-computed via prewarm_metadata.py)
-        # On-the-fly semantic search removed since all embeddings are already in vector store
-
+        # OPTIMIZATION: When filter tables are selected, skip vector search since filter tables are mandatory
+        # Vector search is only needed when no filter is active (to find relevant tables from all tables)
         vector_tables: List[Tuple[TableCard, float]] = []
-
-        # Vector store semantic search for tables only (with similarity threshold)
-        if self.vector_store and self.provider:
-            if table_filter:
-                LOGGER.info("Step 1 - Vector store semantic search for table cards (similarity threshold: 0.5, filtered to %d tables)", len(table_filter))
-            else:
-                LOGGER.info("Step 1 - Vector store semantic search for table cards (similarity threshold: 0.5)")
-            vector_tables = self._vector_hits(
-                question,
-                graph,
-                max_tables=max_tables,
-                similarity_threshold=0.5,
-                table_filter=table_filter,
-            )
-            LOGGER.info("  Found %d tables from vector store (score >= 0.5)", len(vector_tables))
-            for idx, (card, score) in enumerate(vector_tables, 1):
-                LOGGER.info("  %d. %s (vector score: %.4f)", idx, card.name, score)
-        else:
-            LOGGER.warning("Vector store not available (vector_store=%s, provider=%s) - cannot retrieve tables", 
-                       self.vector_store is not None, self.provider is not None)
-            if not self.vector_store:
-                LOGGER.warning("  Run 'python scripts/prewarm_metadata.py' to generate embeddings")
-
-        # Use vector search results directly (no merging needed since we only use vector search)
-        LOGGER.info("Step 2 - Using vector search results")
-        selected_tables = self._merge_tables(
-            [],  # No heuristic tables
-            vector_tables,
-            max_tables,
-            graph,  # Pass graph for schema preference logic
-        )
-        LOGGER.info("  Selected %d tables after merging:", len(selected_tables))
-        for idx, card in enumerate(selected_tables, 1):
-            schema_prefix = f"{card.schema}." if card.schema else ""
-            LOGGER.info("  %d. %s%s (columns: %d)", idx, schema_prefix, card.name, len(card.columns))
+        selected_tables: List[TableCard] = []
+        filter_set_lower = {t.lower() for t in table_filter} if table_filter else set()
         
-        # Step 4b: Expand selection to include FK-referenced tables (multi-hop expansion)
+        if table_filter and len(table_filter) > 0:
+            # Filter is active: Skip vector search, add filter tables directly (they're mandatory)
+            LOGGER.info("Step 1 - Filter tables selected: Skipping vector search (filter tables are mandatory)")
+            LOGGER.info("  📌 Adding %d filter tables directly (mandatory, always included): %s", 
+                       len(table_filter), table_filter)
+            
+            # Add filter tables directly from graph
+            full_graph_table_map = {card.name.lower(): card for card in graph.tables}
+            full_graph_table_map_original = {card.name: card for card in graph.tables}
+            
+            for table_name in table_filter:
+                card = (full_graph_table_map_original.get(table_name) or 
+                        full_graph_table_map.get(table_name.lower()))
+                if card:
+                    selected_tables.append(card)
+                    LOGGER.info("    + %s%s (columns: %d) [📌 FILTER - MANDATORY]", 
+                               f"{card.schema}." if card.schema else "", card.name, len(card.columns))
+                else:
+                    LOGGER.warning("    ⚠️  Filter table '%s' not found in graph (will be ignored)", table_name)
+            
+            if not selected_tables:
+                LOGGER.error("  ⚠️  CRITICAL: No valid filter tables found! All filter tables were invalid.")
+                LOGGER.error("     Available tables in graph: %s", [t.name for t in graph.tables[:10]])
+        else:
+            # No filter: Use vector search to find relevant tables
+            LOGGER.info("Step 1 - No filter: Using vector search to find relevant tables")
+            if self.vector_store and self.provider:
+                similarity_threshold = self.limits_config.similarity_threshold_no_filter
+                LOGGER.info("  Vector store semantic search (similarity threshold: %.2f)", similarity_threshold)
+                vector_tables = self._vector_hits(
+                    question,
+                    graph,
+                    max_tables=max_tables,
+                    similarity_threshold=similarity_threshold,
+                    table_filter=None,  # No filter
+                )
+                LOGGER.info("  Found %d tables from vector store (score >= %.2f)", len(vector_tables), similarity_threshold)
+                for idx, (card, score) in enumerate(vector_tables, 1):
+                    LOGGER.info("  %d. %s (vector score: %.4f)", idx, card.name, score)
+                
+                # Use vector search results
+                selected_tables = self._merge_tables(
+                    [],  # No heuristic tables
+                    vector_tables,
+                    max_tables,
+                    graph,  # Pass graph for schema preference logic
+                )
+                LOGGER.info("  Selected %d tables from vector search:", len(selected_tables))
+                for idx, card in enumerate(selected_tables, 1):
+                    schema_prefix = f"{card.schema}." if card.schema else ""
+                    LOGGER.info("  %d. %s%s (columns: %d) [🔍 VECTOR]", idx, schema_prefix, card.name, len(card.columns))
+            else:
+                LOGGER.warning("Vector store not available (vector_store=%s, provider=%s) - cannot retrieve tables", 
+                           self.vector_store is not None, self.provider is not None)
+                if not self.vector_store:
+                    LOGGER.warning("  Run 'python scripts/prewarm_metadata.py' to generate embeddings")
+        
+        # Step 2: Detect tables mentioned in question (works with or without filter)
+        # This scans ALL tables in graph to catch any mention, even if not in filter
+        LOGGER.info("Step 2 - Detecting tables mentioned in question")
+        question_lower = question.lower()
+        mentioned_table_names = set()
+        for table_card in graph.tables:
+            table_name_lower = table_card.name.lower()
+            # Check if table name appears in question (with word boundaries)
+            patterns = [
+                f" {table_name_lower} ",
+                f" {table_name_lower}'",
+                f" {table_name_lower},",
+                f" {table_name_lower}.",
+                f" {table_name_lower}?",
+                f" {table_name_lower}!",
+                f"the {table_name_lower} ",
+                f"the {table_name_lower}'",
+                f"table {table_name_lower}",
+                f"about {table_name_lower}",
+                f"for {table_name_lower}",
+            ]
+            if any(pattern in question_lower for pattern in patterns) or \
+               question_lower.startswith(table_name_lower + " ") or \
+               question_lower.endswith(" " + table_name_lower):
+                mentioned_table_names.add(table_card.name.lower())
+                LOGGER.info("  Detected table name '%s' mentioned in question", table_card.name)
+        
+        # Add mentioned tables if not already included
+        if mentioned_table_names:
+            full_graph_table_map = {card.name.lower(): card for card in graph.tables}
+            full_graph_table_map_original = {card.name: card for card in graph.tables}
+            selected_table_names = {t.name.lower() for t in selected_tables}
+            
+            for mentioned_table_lower in mentioned_table_names:
+                if mentioned_table_lower not in selected_table_names:
+                    card = (full_graph_table_map_original.get(mentioned_table_lower) or 
+                            full_graph_table_map.get(mentioned_table_lower))
+                    if card:
+                        selected_tables.append(card)
+                        LOGGER.info("  + %s%s (mentioned in question, not in filter) [💬 MENTIONED]", 
+                                   f"{card.schema}." if card.schema else "", card.name)
+        
+        # Step 3: Expand selection to include FK-referenced tables (multi-hop expansion)
         # This ensures we have complete join paths even if intermediate tables weren't semantically matched
         LOGGER.info(
-            "Step 3b - Expanding table selection to include FK-referenced tables (multi-hop, max_depth=%d, max_expansion=%d)",
+            "Step 3 - Expanding table selection to include FK-referenced tables (multi-hop, max_depth=%d, max_expansion=%d)",
             fk_expansion_max_depth, fk_expansion_max_tables
         )
         try:
@@ -222,20 +288,32 @@ class SemanticRetriever:
             )
             if len(expanded_tables) > len(selected_tables):
                 new_tables = [t for t in expanded_tables if t not in selected_tables]
+                filter_set = {t.lower() for t in table_filter} if table_filter else set()
+                
                 LOGGER.info("  Expanded from %d to %d tables (+%d FK-referenced tables)", 
                            len(selected_tables), len(expanded_tables), len(new_tables))
+                
+                # Categorize new tables
+                fk_tables_in_filter = []
+                fk_tables_outside_filter = []
                 for card in new_tables:
                     schema_prefix = f"{card.schema}." if card.schema else ""
-                    LOGGER.info("    + %s%s (added via FK reference)", schema_prefix, card.name)
+                    if table_filter and card.name.lower() in filter_set:
+                        fk_tables_in_filter.append(card.name)
+                        LOGGER.info("    + %s%s (added via FK, also in filter)", schema_prefix, card.name)
+                    else:
+                        fk_tables_outside_filter.append(card.name)
+                        LOGGER.info("    + %s%s (added via FK, outside filter)", schema_prefix, card.name)
                 
-                # Log if FK expansion added tables not in filter (for accuracy)
+                # Log summary of FK expansion
                 if table_filter:
-                    filter_set = {t.lower() for t in table_filter}
-                    tables_not_in_filter = [t for t in new_tables if t.name.lower() not in filter_set]
-                    if tables_not_in_filter:
-                        LOGGER.info("  FK expansion added %d table(s) not in filter (required for join accuracy): %s",
-                                   len(tables_not_in_filter),
-                                   [t.name for t in tables_not_in_filter[:5]])
+                    LOGGER.info("  🔗 FK Expansion Summary:")
+                    LOGGER.info("    - Tables in filter: %d - %s", len(fk_tables_in_filter), fk_tables_in_filter)
+                    LOGGER.info("    - Tables outside filter: %d - %s", len(fk_tables_outside_filter), fk_tables_outside_filter[:10])
+                    if fk_tables_outside_filter:
+                        LOGGER.info("    ℹ️  Tables outside filter are added for join accuracy (unrestricted FK expansion)")
+                else:
+                    LOGGER.info("  🔗 FK Expansion: Added %d tables via foreign key relationships", len(new_tables))
                 
                 selected_tables = expanded_tables
             else:
@@ -250,17 +328,20 @@ class SemanticRetriever:
             LOGGER.info("  Continuing with %d originally selected tables", len(selected_tables))
 
         # Step 5: Get ALL columns for selected tables (no semantic search on columns)
+        # IMPORTANT: By default, ALL columns for ALL selected tables are included (max_columns=None)
         LOGGER.info("Step 4 - Getting ALL columns for selected tables (no semantic search)")
         selected_table_names = {card.name.lower() for card in selected_tables}  # Normalize to lowercase
         selected_table_names_original = {card.name for card in selected_tables}  # Keep original for logging
         LOGGER.info("  Looking for columns in tables: %s", sorted(selected_table_names_original))
         
         # Case-insensitive matching: normalize both sides to lowercase
+        # This gets ALL columns for ALL selected tables (including multi-hop tables)
         selected_columns = [
             card for card in graph.column_cards
             if card.table.lower() in selected_table_names
         ]
-        LOGGER.info("  Found %d total columns for selected tables", len(selected_columns))
+        LOGGER.info("  ✅ Found %d total columns for ALL selected tables (including multi-hop tables)", len(selected_columns))
+        LOGGER.info("  ℹ️  All columns are included by default (max_columns=None means no limit)")
         
         # Group columns by table for logging
         columns_by_table: Dict[str, List[ColumnCard]] = {}
@@ -309,10 +390,15 @@ class SemanticRetriever:
         LOGGER.info("Step 6 - Validation checks")
         if not selected_tables:
             LOGGER.error("  ⚠️  CRITICAL: No tables selected! This will cause issues.")
-            LOGGER.error("     Vector tables (score >= 0.5): %d", len(vector_tables))
-            LOGGER.error("     Available tables in graph: %s", 
-                        [t.name for t in graph.tables[:10]])
-            LOGGER.error("     Run 'python scripts/prewarm_metadata.py' if vector store is empty")
+            if table_filter:
+                LOGGER.error("     Filter tables: %s", table_filter)
+                LOGGER.error("     Available tables in graph: %s", 
+                            [t.name for t in graph.tables[:10]])
+            else:
+                LOGGER.error("     Vector tables found: %d", len(vector_tables))
+                LOGGER.error("     Available tables in graph: %s", 
+                            [t.name for t in graph.tables[:10]])
+                LOGGER.error("     Run 'python scripts/prewarm_metadata.py' if vector store is empty")
             # Don't raise exception - let caller handle it, but log clearly
         else:
             LOGGER.info("  ✅ Tables: %d selected", len(selected_tables))
@@ -332,16 +418,37 @@ class SemanticRetriever:
         else:
             LOGGER.info("  ✅ Relationships: %d selected", len(selected_relationships))
 
-        # Summary
+        # Summary with breakdown
+        filter_set_lower = {t.lower() for t in table_filter} if table_filter else set()
+        final_filter_tables = [t.name for t in selected_tables if t.name.lower() in filter_set_lower]
+        final_other_tables = [t.name for t in selected_tables if t.name.lower() not in filter_set_lower]
+        
         LOGGER.info("=" * 80)
-        LOGGER.info("RETRIEVAL SUMMARY - Passing to LLM:")
-        LOGGER.info("  Tables: %d", len(selected_tables))
-        LOGGER.info("  Columns: %d", len(selected_columns))
-        LOGGER.info("  Relationships: %d", len(selected_relationships))
+        LOGGER.info("RETRIEVAL SUMMARY - Context passed to LLM:")
+        LOGGER.info("  📊 Total Tables: %d", len(selected_tables))
+        if table_filter:
+            LOGGER.info("    - 📌 Filter tables (mandatory, no vector search): %d - %s", len(final_filter_tables), final_filter_tables)
+            if final_other_tables:
+                LOGGER.info("    - 💬 Question mentions + 🔗 FK expanded: %d - %s", len(final_other_tables), final_other_tables[:10])
+        else:
+            LOGGER.info("    - 🔍 Vector search tables: %d", len(selected_tables))
+        LOGGER.info("  📋 Total Columns: %d (ALL columns for ALL selected tables)", len(selected_columns))
+        LOGGER.info("    ℹ️  All columns are included by default (max_columns=None means no limit)")
+        LOGGER.info("  🔗 Total Relationships: %d", len(selected_relationships))
+        LOGGER.info("  📝 Table names: %s", [t.name for t in selected_tables])
         LOGGER.info("=" * 80)
 
+        # Build details for retrieval result
+        # When filter is active, vector_tables is empty (we skipped vector search)
+        vector_tables_details = []
+        if vector_tables:
+            vector_tables_details = [(card.name, float(score)) for card, score in vector_tables[:max_tables]]
+        elif table_filter:
+            # When filter is active, show filter tables with default score
+            vector_tables_details = [(card.name, 1.0) for card in selected_tables if card.name.lower() in filter_set_lower]
+        
         details = {
-            "vector_tables": [(card.name, float(score)) for card, score in vector_tables[:max_tables]],
+            "vector_tables": vector_tables_details,
             "selected_columns": [(f"{card.table}.{card.column.name}", 1.0) for card in selected_columns],
             "selected_relationships": [rel.render() for rel in selected_relationships],
         }
@@ -529,19 +636,38 @@ class SemanticRetriever:
         full_graph_table_map = {card.name.lower(): card for card in graph.tables}
         full_graph_table_map_original = {card.name: card for card in graph.tables}
         
-        # Add tables from filter if not already included
+        # Add tables from filter if not already included (MANDATORY - always included)
         if table_filter:
+            # Validate filter table names exist in graph
+            invalid_tables = []
+            valid_tables = []
             for table_name in table_filter:
+                card = (table_map_original.get(table_name) or 
+                        table_map.get(table_name.lower()) or
+                        full_graph_table_map_original.get(table_name) or 
+                        full_graph_table_map.get(table_name.lower()))
+                if card:
+                    valid_tables.append(table_name)
+                else:
+                    invalid_tables.append(table_name)
+            
+            if invalid_tables:
+                LOGGER.warning("Invalid table names in filter (not found in graph): %s. These will be ignored.", invalid_tables)
+            
+            # Process only valid tables (MANDATORY - always included)
+            for table_name in valid_tables:
                 if table_name.lower() not in included_table_names:
-                    # Find the table card from graph (try filtered map first, then full graph)
-                    card = table_map_original.get(table_name) or table_map.get(table_name.lower()) or \
-                           full_graph_table_map_original.get(table_name) or full_graph_table_map.get(table_name.lower())
+                    card = (table_map_original.get(table_name) or 
+                            table_map.get(table_name.lower()) or
+                            full_graph_table_map_original.get(table_name) or 
+                            full_graph_table_map.get(table_name.lower()))
                     if card:
-                        # Add with a default low score (0.5) since it wasn't in vector results
+                        # Add with a default score (0.5) since it wasn't in vector results
+                        # This is MANDATORY - will be guaranteed in final result even if exceeds max_tables
                         table_hits.append((card, 0.5))
                         missing_tables.append(table_name)
                         included_table_names.add(table_name.lower())
-                        LOGGER.info("Added table '%s' from filter (not found in vector results, using default score 0.5)", table_name)
+                        LOGGER.info("Added mandatory table '%s' from filter (not in vector results, using default score 0.5)", table_name)
         
         # Add tables mentioned in question if not already included
         for mentioned_table_lower in mentioned_table_names:
@@ -559,11 +685,40 @@ class SemanticRetriever:
             LOGGER.info("Added %d table(s) that weren't in vector results: %s", 
                        len(missing_tables), missing_tables)
         
-        # Sort by score (descending) and limit to max_tables
-        table_hits.sort(key=lambda item: item[1], reverse=True)
-        table_hits = table_hits[:max_tables]
+        # CRITICAL FIX: Separate mandatory filter tables from scored tables
+        # This ensures mandatory filter tables are NEVER cut off by max_tables limit
+        if table_filter and table_hits:
+            mandatory_tables = []
+            scored_tables = []
+            filter_set_lower = {t.lower() for t in table_filter}
+            
+            for card, score in table_hits:
+                if card.name.lower() in filter_set_lower:
+                    mandatory_tables.append((card, score))
+                else:
+                    scored_tables.append((card, score))
+            
+            # Sort scored tables by score (descending)
+            scored_tables.sort(key=lambda item: item[1], reverse=True)
+            
+            # Guarantee mandatory tables are included FIRST, then add scored tables up to limit
+            # If mandatory tables exceed max_tables, include all of them (user intent takes priority)
+            remaining_slots = max_tables - len(mandatory_tables)
+            if remaining_slots > 0:
+                table_hits = mandatory_tables + scored_tables[:remaining_slots]
+            else:
+                # All mandatory tables, even if exceeds max_tables
+                table_hits = mandatory_tables
+                LOGGER.warning(
+                    "Mandatory filter tables (%d) exceed max_tables (%d). All filter tables included to respect user selection.",
+                    len(mandatory_tables), max_tables
+                )
+        else:
+            # No filter: Sort by score and limit normally
+            table_hits.sort(key=lambda item: item[1], reverse=True)
+            table_hits = table_hits[:max_tables]
         
-        LOGGER.info("Vector search results: %d matched (score >= %.2f), %d filtered (score < %.2f), returning top %d", 
+        LOGGER.info("Vector search results: %d matched (score >= %.2f), %d filtered (score < %.2f), returning %d tables", 
                     matched_count, similarity_threshold, filtered_count, similarity_threshold, len(table_hits))
         
         return table_hits

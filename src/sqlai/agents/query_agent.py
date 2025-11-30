@@ -27,6 +27,7 @@ except ImportError as exc:
     ) from exc
 from sqlalchemy.engine import Engine
 
+from sqlai.config import load_limits_config
 from sqlai.llm.prompt_templates import (
     agent_prompt,
     CRITIC_PROMPT,
@@ -124,8 +125,18 @@ def _format_query_analysis_section(query_analysis: Dict[str, Any]) -> str:
     checklist = query_analysis.get("verification_checklist", [])
     if checklist:
         parts.append("[VERIFICATION CHECKLIST - Verify After SQL Generation]")
+        parts.append("**CRITICAL - YOU MUST CHECK EVERY ITEM BELOW:**")
+        parts.append("Go through each checklist item one by one. For each item:")
+        parts.append("1. Read the item (e.g., '✓ CTE names do not include schema prefixes')")
+        parts.append("2. Search the SQL for violations (e.g., search for 'WITH schema_name.' or 'FROM schema_name.' followed by a CTE name)")
+        parts.append("3. If you find a violation, IMMEDIATELY reject the SQL and provide a repair hint")
+        parts.append("4. Only accept SQL if ALL checklist items pass")
+        parts.append("**DO NOT skip any checklist items. Check EVERY single one.**")
+        parts.append("")
         for item in checklist:
             parts.append(f"✓ {item}")
+        parts.append("")
+        parts.append("**REMINDER: Check EVERY item above before accepting the SQL.**")
         parts.append("")
     
     # Potential pitfalls
@@ -541,6 +552,31 @@ def _safe_invoke_json(chain: Any, payload: Dict[str, Any], llm: Any) -> Dict[str
                 pass
         return result
     except Exception as exc:
+        # Check if this is an API error (402, quota, etc.) that prevents LLM from responding
+        error_str = str(exc).lower()
+        error_type = type(exc).__name__
+        is_api_error = (
+            "402" in error_str or "payment required" in error_str or
+            "quota" in error_str or "exceeded" in error_str or
+            "api" in error_type.lower() or "http" in error_type.lower() or
+            "status" in error_type.lower()
+        )
+        
+        # If it's an API error and we don't have raw_content, this means the LLM call failed
+        # For critic calls, we should return a reject verdict with an error reason
+        if is_api_error and not raw_content:
+            LOGGER.warning("LLM API call failed with error: %s (%s). Cannot review SQL.", error_type, exc)
+            # Check if this is a critic call (has "verdict" in expected structure) vs repair call
+            # We'll detect this by checking if the chain is INTENT_CRITIC_PROMPT or CRITIC_PROMPT
+            # For now, return a structure that indicates failure
+            return {
+                "verdict": "reject",
+                "reasons": [f"LLM API call failed: {error_type}. Cannot review SQL. Error: {str(exc)[:200]}"],
+                "repair_hints": ["Fix LLM/API configuration and retry. The SQL could not be reviewed due to API error."],
+                "__raw": None,
+                "__api_error": True
+            }
+        
         # Try to obtain raw content and repair it
         if not raw_content:
             # Last resort: try to invoke prompt|llm again if we have them
@@ -574,12 +610,30 @@ def _safe_invoke_json(chain: Any, payload: Dict[str, Any], llm: Any) -> Dict[str
                     raw_content = exc.llm_output["text"]
                 elif isinstance(exc.llm_output, str):
                     raw_content = exc.llm_output
-            # Try response attribute
+            # Try response attribute (HTTP response from API errors)
             elif hasattr(exc, "response") and exc.response:
-                if hasattr(exc.response, "content"):
-                    raw_content = getattr(exc.response, "content", "")
-                elif isinstance(exc.response, str):
-                    raw_content = exc.response
+                # For HTTP errors, check if response body contains error information
+                if hasattr(exc.response, "read"):
+                    try:
+                        # Try to read response body
+                        response_body = exc.response.read()
+                        if response_body:
+                            if isinstance(response_body, bytes):
+                                response_body = response_body.decode('utf-8', errors='ignore')
+                            # Check if it's an error JSON (contains "error", "message", etc.)
+                            if isinstance(response_body, str) and any(keyword in response_body.lower() for keyword in ["error", "payment required", "quota", "exceeded", "402"]):
+                                LOGGER.debug("Response body contains error message, not LLM output")
+                                # Don't use this as raw_content - it's an error, not a response
+                                raw_content = ""
+                            else:
+                                raw_content = response_body
+                    except Exception:
+                        pass
+                if not raw_content:
+                    if hasattr(exc.response, "content"):
+                        raw_content = getattr(exc.response, "content", "")
+                    elif isinstance(exc.response, str):
+                        raw_content = exc.response
             # Check if exception args contain the response (first arg is often the response)
             elif hasattr(exc, "args") and exc.args and len(exc.args) > 0:
                 first_arg = exc.args[0]
@@ -604,6 +658,20 @@ def _safe_invoke_json(chain: Any, payload: Dict[str, Any], llm: Any) -> Dict[str
                 raw_content = raw_content.decode('utf-8', errors='ignore')
             elif not isinstance(raw_content, str):
                 raw_content = str(raw_content)
+        
+        # Check if extracted raw_content is actually an API error message (not a valid LLM response)
+        if raw_content and is_api_error:
+            raw_lower = raw_content.lower()
+            # If the extracted content contains API error keywords, it's not a valid LLM response
+            if any(keyword in raw_lower for keyword in ["payment required", "quota", "exceeded", "402", "credits", "subscribe"]):
+                LOGGER.warning("Extracted content is an API error message, not LLM response. Treating as API failure.")
+                return {
+                    "verdict": "reject",
+                    "reasons": [f"LLM API call failed: {error_type}. Cannot review SQL. Error: {str(exc)[:200]}"],
+                    "repair_hints": ["Fix LLM/API configuration and retry. The SQL could not be reviewed due to API error."],
+                    "__raw": raw_content,
+                    "__api_error": True
+                }
         
         # Filter out error messages - don't use exception string if it's just an error message
         if raw_content and ("Invalid json output" in raw_content or "For troubleshooting" in raw_content):
@@ -643,9 +711,30 @@ def _safe_invoke_json(chain: Any, payload: Dict[str, Any], llm: Any) -> Dict[str
                     LOGGER.warning("Final attempt to get raw response also failed: %s", final_exc)
             
             if not sanitized:
+                # Check if this is an API error
+                error_str = str(exc).lower()
+                error_type = type(exc).__name__
+                is_api_error = (
+                    "402" in error_str or "payment required" in error_str or
+                    "quota" in error_str or "exceeded" in error_str or
+                    "api" in error_type.lower() or "http" in error_type.lower() or
+                    "status" in error_type.lower()
+                )
+                
                 # Return a structure that matches what the caller expects based on context
-                # For repair calls, return patched_sql structure; for critic, return verdict structure
-                return {"patched_sql": "", "what_changed": [], "why": f"Failed to extract raw LLM response. Exception: {type(exc).__name__}: {exc}", "__raw": None}
+                # For critic calls, return verdict structure; for repair calls, return patched_sql structure
+                if is_api_error:
+                    # This is likely a critic call (repair calls would have been caught earlier)
+                    return {
+                        "verdict": "reject",
+                        "reasons": [f"LLM API call failed: {error_type}. Cannot review SQL. Error: {str(exc)[:200]}"],
+                        "repair_hints": ["Fix LLM/API configuration and retry. The SQL could not be reviewed due to API error."],
+                        "__raw": None,
+                        "__api_error": True
+                    }
+                else:
+                    # For repair calls or other errors, return repair structure
+                    return {"patched_sql": "", "what_changed": [], "why": f"Failed to extract raw LLM response. Exception: {type(exc).__name__}: {exc}", "__raw": None}
         
         try:
             if fixer is not None:
@@ -742,7 +831,9 @@ class ExecutionResult:
     stats: Dict[str, Any]
 
 
-def _profile_dataframe(df: pd.DataFrame, max_top_values: int = 5) -> Dict[str, Any]:
+def _profile_dataframe(df: pd.DataFrame, max_top_values: int | None = None) -> Dict[str, Any]:
+    if max_top_values is None:
+        max_top_values = load_limits_config().max_top_values
     summary: Dict[str, Any] = {"row_count": int(len(df)) if df is not None else 0, "columns": []}
     if df is None or df.empty:
         return summary
@@ -1112,8 +1203,16 @@ def create_query_workflow(llm: Any, engine: Engine, max_repair_iterations: int =
     # After an intent repair, conditionally continue or fail to avoid an extra 4th critic call
     def _route_after_intent_repair(state: QueryState) -> str:
         attempts = state.get("intent_attempts", 0)
-        last_critic = state.get("intent_critic") or {}
+        execution_error = state.get("execution_error")
+        
+        # If execution_error was set (e.g., max attempts reached in repair node), fail immediately
+        if execution_error:
+            LOGGER.info("Intent repair routing: execution_error set, failing. Error: %s", execution_error[:200])
+            return "fail"
+        
+        # Check if we've exceeded max attempts (safety check - should not happen if repair node works correctly)
         if attempts >= MAX_INTENT_REPAIRS:
+            last_critic = state.get("intent_critic") or {}
             reasons = last_critic.get("reasons") or []
             sql = state.get("plan", {}).get("sql")
             state["execution_error"] = (
@@ -1121,7 +1220,10 @@ def create_query_workflow(llm: Any, engine: Engine, max_repair_iterations: int =
                 f"{attempts} intent repair attempt(s).\n"
                 f"Reasons: {reasons}\n\nLast SQL:\n{sql}"
             )
+            LOGGER.warning("Intent repair routing: Max attempts (%d) reached, failing to prevent infinite loop", MAX_INTENT_REPAIRS)
             return "fail"
+        
+        LOGGER.debug("Intent repair routing: Attempts %d/%d, continuing to intent_critic", attempts, MAX_INTENT_REPAIRS)
         return "intent_critic"
     graph.add_conditional_edges("intent_repair", _route_after_intent_repair, {"intent_critic": "intent_critic", "fail": "fail"})
     graph.add_conditional_edges(
@@ -1158,6 +1260,15 @@ def _analyze_query(llm: Any):
         # Build rich Graph Context for analysis
         graph_text = _build_rich_graph_context_for_repair(state)
         
+        # Log context being passed to analyze stage
+        prompt_inputs = state.get("prompt_inputs") or {}
+        selected_tables_list = prompt_inputs.get("__selected_tables__", [])
+        LOGGER.info("=" * 80)
+        LOGGER.info("ANALYZE STAGE - Context passed to LLM:")
+        LOGGER.info("  📊 Tables: %d - %s", len(selected_tables_list), selected_tables_list)
+        LOGGER.info("  📝 Graph context: %d chars (rich context with table/column cards)", len(graph_text))
+        LOGGER.info("=" * 80)
+        
         result = _safe_invoke_json(
             chain,
             {
@@ -1170,12 +1281,30 @@ def _analyze_query(llm: Any):
         )
         
         # Store analysis results in state
+        verification_checklist = result.get("verification_checklist", [])
+        
+        # CRITICAL: If CTEs are mentioned in complex_requirements or todo_list, ensure CTE schema prefix check is in checklist
+        complex_requirements = result.get("complex_requirements", [])
+        todo_list = result.get("todo_list", [])
+        uses_ctes = any("CTE" in req.upper() or "WITH" in req.upper() for req in complex_requirements) or \
+                   any("CTE" in todo.upper() or "WITH" in todo.upper() for todo in todo_list)
+        
+        if uses_ctes:
+            # Make CTE check very explicit and prominent
+            cte_check_item = "CTE names do not include schema prefixes - Check for patterns like 'WITH schema_name.cte_name AS' or 'FROM schema_name.cte_name' and reject if found"
+            # Check if already in checklist (case-insensitive)
+            checklist_lower = [item.lower() for item in verification_checklist]
+            if not any("cte" in item and "schema" in item and "prefix" in item for item in checklist_lower):
+                # Add at the beginning for prominence
+                verification_checklist.insert(0, cte_check_item)
+                LOGGER.info("Added CTE schema prefix check to verification checklist (CTEs detected in requirements) - placed at top for prominence")
+        
         analysis = {
             "analysis": result.get("analysis", ""),
-            "todo_list": result.get("todo_list", []),
-            "verification_checklist": result.get("verification_checklist", []),
+            "todo_list": todo_list,
+            "verification_checklist": verification_checklist,
             "potential_pitfalls": result.get("potential_pitfalls", []),
-            "complex_requirements": result.get("complex_requirements", []),
+            "complex_requirements": complex_requirements,
         }
         
         LOGGER.info("Query analysis completed: %d TODO items, %d checklist items, %d pitfalls identified",
@@ -1211,10 +1340,18 @@ def _plan_sql(llm: Any):
         prompt_inputs["query_analysis_section"] = _format_query_analysis_section(query_analysis)
         
         # Log what's being passed to the prompt (summary)
-        LOGGER.info("Prompt inputs summary: table_cards=%d chars, column_cards=%d chars, relationship_map=%d chars",
-                   len(prompt_inputs.get("table_cards", "") or ""),
-                   len(prompt_inputs.get("column_cards", "") or ""),
-                   len(prompt_inputs.get("relationship_map", "") or ""))
+        table_cards_text = prompt_inputs.get("table_cards", "") or ""
+        column_cards_text = prompt_inputs.get("column_cards", "") or ""
+        relationship_map_text = prompt_inputs.get("relationship_map", "") or ""
+        selected_tables_list = prompt_inputs.get("__selected_tables__", [])
+        
+        LOGGER.info("=" * 80)
+        LOGGER.info("PLANNER STAGE - Context passed to LLM:")
+        LOGGER.info("  📊 Tables: %d - %s", len(selected_tables_list), selected_tables_list)
+        LOGGER.info("  📋 Columns: %d (from __selected_columns__)", len(prompt_inputs.get("__selected_columns__", [])))
+        LOGGER.info("  📝 Context sizes: table_cards=%d chars, column_cards=%d chars, relationship_map=%d chars",
+                   len(table_cards_text), len(column_cards_text), len(relationship_map_text))
+        LOGGER.info("=" * 80)
         
         # Format the prompt to get the actual messages that will be sent to LLM
         formatted_prompt_text = ""
@@ -1425,6 +1562,133 @@ def _plan_sql(llm: Any):
                 LOGGER.warning("Planner LLM returned empty response. This may indicate a model compatibility issue.")
             plan = parser.parse(sanitized_planner_text)
         except Exception as parse_exc:
+            # Check if this is an API error (402, quota, payment required) that prevents LLM from responding
+            error_str = str(parse_exc).lower()
+            error_type = type(parse_exc).__name__
+            is_api_error = (
+                "402" in error_str or "payment required" in error_str or
+                "quota" in error_str or "exceeded" in error_str or
+                "credits" in error_str or "subscribe" in error_str or
+                "api" in error_type.lower() or "http" in error_type.lower() or
+                "status" in error_type.lower()
+            )
+            
+            # Check if this is a context length error (happens during invoke, before parsing)
+            is_context_error = (
+                "context length" in error_str or
+                "maximum context" in error_str or
+                ("exceeds" in error_str and ("token" in error_str or "context" in error_str)) or
+                (error_type == "BadRequestError" and ("context" in error_str or "token" in error_str))
+            )
+            
+            if is_api_error:
+                # Extract error message from exception
+                error_message = str(parse_exc)
+                # Try to extract a more user-friendly message
+                if "402" in error_str or "payment required" in error_str:
+                    if "exceeded" in error_str or "credits" in error_str:
+                        error_message = (
+                            "LLM API quota exceeded. You have exceeded your monthly included credits for the inference provider. "
+                            "Please subscribe to PRO or upgrade your plan to continue using this model. "
+                            "You can change the model in the sidebar under 'LLM Configuration'."
+                        )
+                    else:
+                        error_message = (
+                            "LLM API payment required. Please check your account status or subscription. "
+                            "You can change the model in the sidebar under 'LLM Configuration'."
+                        )
+                elif "quota" in error_str or "exceeded" in error_str:
+                    error_message = (
+                        "LLM API quota exceeded. Please upgrade your plan or change to a different model. "
+                        "You can change the model in the sidebar under 'LLM Configuration'."
+                    )
+                else:
+                    error_message = (
+                        f"LLM API error: {error_message}. "
+                        "Please check your API configuration or change the model in the sidebar under 'LLM Configuration'."
+                    )
+                
+                LOGGER.error("Planner API error: %s", error_message)
+                
+                # Set execution error so it's displayed to user
+                return {
+                    **state,
+                    "execution_error": error_message,
+                    "plan": {
+                        "sql": "",
+                        "plan": {},
+                        "rationale_summary": "",
+                        "tests": [],
+                        "summary": "",
+                        "followups": [],
+                        "sql_generation_note": "LLM API error - quota/payment issue",
+                    },
+                }
+            
+            if is_context_error:
+                # Extract context limit and requested tokens if available
+                model_limit = None
+                requested = None
+                prompt_tokens = None
+                completion_tokens = None
+                
+                # Try to parse error message for details
+                import re
+                if "maximum context length is" in error_str:
+                    match = re.search(r"maximum context length is (\d+)", error_str)
+                    if match:
+                        model_limit = int(match.group(1))
+                if "you requested" in error_str:
+                    match = re.search(r"you requested (\d+) tokens", error_str)
+                    if match:
+                        requested = int(match.group(1))
+                if "in the messages" in error_str:
+                    match = re.search(r"(\d+) in the messages", error_str)
+                    if match:
+                        prompt_tokens = int(match.group(1))
+                if "in the completion" in error_str:
+                    match = re.search(r"(\d+) in the completion", error_str)
+                    if match:
+                        completion_tokens = int(match.group(1))
+                
+                # Build user-friendly error message
+                error_msg_parts = [
+                    "The prompt is too large for this model's context window.",
+                ]
+                if model_limit:
+                    error_msg_parts.append(f"Model context limit: {model_limit:,} tokens.")
+                if prompt_tokens:
+                    error_msg_parts.append(f"Prompt size: {prompt_tokens:,} tokens.")
+                if completion_tokens:
+                    error_msg_parts.append(f"Requested completion: {completion_tokens:,} tokens.")
+                if requested:
+                    error_msg_parts.append(f"Total requested: {requested:,} tokens.")
+                
+                error_msg_parts.append(
+                    "\n**Solution:** Please change to a model with a larger context window (e.g., "
+                    "GPT-4 Turbo with 128k tokens, Claude 3 Opus with 200k tokens, or a model "
+                    "specifically designed for long contexts). You can change the model in the "
+                    "sidebar under 'LLM Configuration'."
+                )
+                
+                error_message = " ".join(error_msg_parts)
+                LOGGER.error("Context length error: %s", error_message)
+                
+                # Set execution error so it's displayed to user
+                return {
+                    **state,
+                    "execution_error": error_message,
+                    "plan": {
+                        "sql": "",
+                        "plan": {},
+                        "rationale_summary": "",
+                        "tests": [],
+                        "summary": "",
+                        "followups": [],
+                        "sql_generation_note": "Context length exceeded - model needs larger context window",
+                    },
+                }
+            
             LOGGER.debug("Planner JSON parsing failed: %s. Raw response length: %d", parse_exc, len(raw_planner_text) if raw_planner_text else 0)
             # Fallback: attempt repair using raw response we already captured
             try:
@@ -1595,7 +1859,12 @@ def _intent_critic(llm: Any):
         LOGGER.info("Intent critic iteration %d/%d (MAX)", attempts + 1, MAX_INTENT_REPAIRS)
         plan = state.get("plan") or {}
         sql = plan.get("sql")
+        
+        # Validate: System prompt says "return exactly ONE SQL query"
+        # If planner returned multiple, this is an error that needs fixing
         if isinstance(sql, list):
+            if len(sql) > 1:
+                LOGGER.warning("Planner returned %d SQL statements, but prompt requires exactly ONE. This will be flagged by Intent Critic.", len(sql))
             sql_text = "\n".join(sql)
         else:
             sql_text = sql or ""
@@ -1608,10 +1877,30 @@ def _intent_critic(llm: Any):
                     (sql[:200] if isinstance(sql, str) else str(sql)[:200]) if sql else "None")
         
         plan_summary = plan.get("plan") or {}
-        graph_text = state.get("schema_markdown", "")
+        # Use rich Graph Context (table cards, column cards, relationships, value anchors) for better validation
+        graph_text = _build_rich_graph_context_for_repair(state)
+        if not graph_text or not graph_text.strip():
+            # Fallback to simplified schema_markdown
+            graph_text = state.get("schema_markdown", "")
+            if not graph_text or not graph_text.strip():
+                graph_text = "[GRAPH CONTEXT]\nNo schema information available. Cannot validate SQL without table/column context."
+                LOGGER.warning("Intent Critic: Graph context is empty. SQL validation may be limited.")
+        
         desired_columns = state.get("desired_columns") or []
         desired_columns_raw = state.get("desired_columns_raw") or []
         query_analysis = state.get("query_analysis") or {}
+        
+        # Log context being passed to intent critic
+        prompt_inputs = state.get("prompt_inputs") or {}
+        selected_tables_list = prompt_inputs.get("__selected_tables__", [])
+        LOGGER.info("=" * 80)
+        LOGGER.info("INTENT CRITIC STAGE - Context passed to LLM:")
+        LOGGER.info("  📊 Tables: %d - %s", len(selected_tables_list), selected_tables_list)
+        LOGGER.info("  📝 Graph context: %d chars (rich context with table/column cards)", len(graph_text))
+        LOGGER.info("  ❓ Question: %s", state.get("question", "")[:200])
+        LOGGER.info("  📋 SQL to review: %s", sql_text[:500] if sql_text else "(empty)")
+        LOGGER.info("=" * 80)
+        
         result = _safe_invoke_json(
             chain,
             {
@@ -1625,6 +1914,14 @@ def _intent_critic(llm: Any):
             },
             llm,
         )
+        # Check if this was an API error (LLM call failed)
+        if result.get("__api_error"):
+            LOGGER.error("Intent Critic failed due to API error. Cannot review SQL. Verdict: %s", result.get("verdict"))
+            # Don't proceed with repair if API failed - set execution error instead
+            state["execution_error"] = result.get("reasons", ["LLM API call failed. Cannot review SQL."])[0]
+            state["intent_critic"] = result
+            return state
+        
         LOGGER.info("Intent critic iteration %d verdict: %s", attempts + 1, result.get("verdict"))
         if result.get("reasons"):
             LOGGER.info("Intent critic reasons: %s", result.get("reasons"))
@@ -1681,6 +1978,7 @@ def _intent_repair(llm: Any):
             {
                 "dialect": state.get("dialect", ""),
                 "graph": graph_text,
+                "question": state.get("question", ""),
                 "sql": sql_text,
                 "error": error_text,
                 "repair_hints": critic.get("repair_hints", []),
@@ -1690,6 +1988,12 @@ def _intent_repair(llm: Any):
             },
             llm,
         )
+        # Check if this was an API error (LLM call failed)
+        if result.get("__api_error"):
+            LOGGER.error("Intent Repair failed due to API error. Cannot repair SQL. Error: %s", result.get("why", "Unknown API error"))
+            state["execution_error"] = result.get("why", "LLM API call failed. Cannot repair SQL.")
+            return state
+        
         LOGGER.info("Intent repair attempt %d result received", attempts + 1)
         patched_sql = result.get("patched_sql")
         raw_response = result.get("__raw")
@@ -1738,18 +2042,40 @@ def _intent_repair(llm: Any):
             )
             LOGGER.info("Intent repair attempt %d successfully patched SQL", attempts + 1)
             state["plan"] = plan
+            state["intent_attempts"] = attempts + 1
+            state["intent_critic"] = {}
+            state.pop("execution_error", None)
+            return state
         else:
+            # Repair didn't change SQL or returned empty - this could cause infinite loop
             if not patched_sql or not patched_sql.strip():
                 if raw_response:
                     LOGGER.warning("Intent repair attempt %d returned empty patched_sql. Raw LLM response (first 1000 chars): %s", attempts + 1, raw_response[:1000] if len(raw_response) > 1000 else raw_response)
                 else:
                     LOGGER.warning("Intent repair attempt %d returned empty patched_sql and no raw response captured", attempts + 1)
             else:
-                LOGGER.info("Intent repair attempt %d produced no effective change (SQL unchanged)", attempts + 1)
-        state["intent_attempts"] = attempts + 1
-        state["intent_critic"] = {}
-        state.pop("execution_error", None)
-        return state
+                LOGGER.warning("Intent repair attempt %d produced no effective change (SQL unchanged). This may cause infinite loop if critic keeps rejecting.", attempts + 1)
+            
+            # Increment attempts and check if we should fail
+            state["intent_attempts"] = attempts + 1
+            if state["intent_attempts"] >= MAX_INTENT_REPAIRS:
+                # Max attempts reached, fail - DO NOT clear execution_error
+                critic = state.get("intent_critic") or {}
+                reasons = critic.get("reasons", [])
+                sql = state.get("plan", {}).get("sql")
+                state["execution_error"] = (
+                    f"Unable to produce SQL that satisfies the question after "
+                    f"{state['intent_attempts']} intent repair attempt(s).\n"
+                    f"Reasons: {reasons}\n\nLast SQL:\n{sql}"
+                )
+                LOGGER.error("Intent repair loop: Max attempts (%d) reached without SQL change. Failing to prevent infinite loop.", MAX_INTENT_REPAIRS)
+                # Keep execution_error so routing function can detect it
+            else:
+                # Clear critic to force re-evaluation, but keep the attempt count
+                state["intent_critic"] = {}
+                # Only clear execution_error if we're continuing (not at max attempts)
+                state.pop("execution_error", None)
+            return state
 
     return node
 
@@ -1969,11 +2295,19 @@ def _summarise(llm: Any):
                 "- Check that the key information requested in the question is present in your answer.\n"
                 "- Ensure your answer matches the user's intent, not just the SQL results.\n"
                 "- If the results don't fully answer the question, acknowledge what's missing.\n"
-                "- Before finalizing, ask yourself: 'Does this answer what the user asked for?'",
+                "- Before finalizing, ask yourself: 'Does this answer what the user asked for?'\n\n"
+                "**Use Graph Context to explain query structure:**\n"
+                "- Reference table and column names from the Graph Context when explaining the query.\n"
+                "- Use the relationship map to explain how tables were joined.\n"
+                "- Reference the query analysis to explain why certain steps were taken.\n"
+                "- Use dialect-specific terminology when appropriate.",
             ),
             (
                 "human",
                 "Question: {question}\n\n"
+                "Dialect: {dialect}\n\n"
+                "Graph Context:\n{graph}\n\n"
+                "{query_analysis_section}\n\n"
                 "Plan rationale: {rationale}\n\n"
                 "SQL:\n{sql}\n\n"
                 "Table preview:\n{preview}\n\n"
@@ -2012,9 +2346,30 @@ def _summarise(llm: Any):
         combined_preview = f"{preview_markdown}\n\n[DATA SUMMARY]\n{stats_text}"
         sql_text = "\n\n".join(execution.sql for execution in executions)
         plan = state["plan"]
+        
+        # Get graph context (use rich context if available, fallback to simplified)
+        graph_text = _build_rich_graph_context_for_repair(state)
+        if not graph_text or not graph_text.strip():
+            # Fallback to simplified schema_markdown
+            graph_text = state.get("schema_markdown", "")
+            if not graph_text or not graph_text.strip():
+                graph_text = "[GRAPH CONTEXT]\nNo schema information available."
+        
+        # Get query analysis
+        query_analysis = state.get("query_analysis") or {}
+        query_analysis_section = _format_query_analysis_section(query_analysis)
+        if not query_analysis_section or not query_analysis_section.strip():
+            query_analysis_section = "[QUERY ANALYSIS]\nNo specific analysis requirements for this query.\n"
+        
+        # Get dialect
+        dialect = state.get("dialect", "Unknown")
+        
         response = prompt | llm
         summariser_payload = {
             "question": state["question"],
+            "dialect": dialect,
+            "graph": graph_text,
+            "query_analysis_section": query_analysis_section,
             "rationale": plan.get("rationale_summary") or plan.get("rationale", ""),
             "sql": sql_text,
             "preview": combined_preview,
@@ -2138,6 +2493,13 @@ def _post_process_plan(plan: Dict[str, Any], state: QueryState) -> Dict[str, Any
                 qualification_applied = True
             qualified_sqls.append(qualified_sql)
         adjusted = qualified_sqls
+
+    # Note: We do NOT automatically fix CTE schema prefixes here.
+    # Instead, we rely on Intent Critic to catch and Intent Repair to fix it.
+    # This allows the LLM stages to learn and correct mistakes properly.
+    # The checklist (which now automatically includes CTE checks) and Intent Critic
+    # instructions should catch this issue. The prompts have been enhanced with explicit
+    # CTE schema prefix validation instructions.
 
     if isinstance(sql_statements, str):
         plan["sql"] = adjusted[0]
@@ -2508,10 +2870,30 @@ def _critic_sql(llm: Any):
             "steps": plan.get("plan", {}).get("steps", []),
             "notes": plan.get("plan", {}).get("notes", []),
         }
-        graph_text = state.get("schema_markdown", "")
+        # Use rich Graph Context (table cards, column cards, relationships, value anchors) for better validation
+        graph_text = _build_rich_graph_context_for_repair(state)
+        if not graph_text or not graph_text.strip():
+            # Fallback to simplified schema_markdown
+            graph_text = state.get("schema_markdown", "")
+            if not graph_text or not graph_text.strip():
+                graph_text = "[GRAPH CONTEXT]\nNo schema information available. Cannot validate SQL without table/column context."
+                LOGGER.warning("Post-exec Critic: Graph context is empty. SQL validation may be limited.")
         desired_columns = state.get("desired_columns") or []
         desired_columns_raw = state.get("desired_columns_raw") or []
         query_analysis = state.get("query_analysis") or {}
+        
+        # Log context being passed to post-exec critic
+        prompt_inputs = state.get("prompt_inputs") or {}
+        selected_tables_list = prompt_inputs.get("__selected_tables__", [])
+        LOGGER.info("=" * 80)
+        LOGGER.info("POST-EXEC CRITIC STAGE - Context passed to LLM:")
+        LOGGER.info("  📊 Tables: %d - %s", len(selected_tables_list), selected_tables_list)
+        LOGGER.info("  📝 Graph context: %d chars (rich context with table/column cards)", len(graph_text))
+        LOGGER.info("  ❓ Question: %s", state.get("question", "")[:200])
+        LOGGER.info("  📋 SQL to review: %s", sql_text[:500] if sql_text else "(empty)")
+        LOGGER.info("  ⚠️  Execution error: %s", state.get("execution_error", "")[:200] if state.get("execution_error") else "None")
+        LOGGER.info("=" * 80)
+        
         result = _safe_invoke_json(
             chain,
             {
@@ -2526,6 +2908,14 @@ def _critic_sql(llm: Any):
             },
             llm,
         )
+        # Check if this was an API error (LLM call failed)
+        if result.get("__api_error"):
+            LOGGER.error("Post-exec Critic failed due to API error. Cannot review SQL. Verdict: %s", result.get("verdict"))
+            # Set execution error to prevent further repair attempts
+            state["execution_error"] = result.get("reasons", ["LLM API call failed. Cannot review SQL."])[0]
+            state["critic"] = result
+            return state
+        
         LOGGER.info("Post-exec critic iteration %d/%d (MAX) verdict: %s", attempts + 1, MAX_INTENT_REPAIRS, result.get("verdict"))
         if result.get("reasons"):
             LOGGER.info("Post-exec critic reasons: %s", result.get("reasons"))
@@ -2559,11 +2949,22 @@ def _repair_sql(llm: Any):
         desired_columns = state.get("desired_columns") or []
         desired_columns_raw = state.get("desired_columns_raw") or []
         query_analysis = state.get("query_analysis") or {}
+        
+        # Log context being passed to post-exec repair
+        prompt_inputs = state.get("prompt_inputs") or {}
+        selected_tables_list = prompt_inputs.get("__selected_tables__", [])
+        LOGGER.info("=" * 80)
+        LOGGER.info("POST-EXEC REPAIR STAGE - Context passed to LLM:")
+        LOGGER.info("  📊 Tables: %d - %s", len(selected_tables_list), selected_tables_list)
+        LOGGER.info("  📝 Graph context: %d chars (rich context with table/column cards)", len(graph_text))
+        LOGGER.info("=" * 80)
+        
         result = _safe_invoke_json(
             chain,
             {
                 "dialect": state.get("dialect", ""),
                 "graph": graph_text,
+                "question": state.get("question", ""),
                 "sql": sql_text,
                 "error": state.get("execution_error", ""),
                 "repair_hints": critic.get("repair_hints", []),
@@ -2573,6 +2974,12 @@ def _repair_sql(llm: Any):
             },
             llm,
         )
+        # Check if this was an API error (LLM call failed)
+        if result.get("__api_error"):
+            LOGGER.error("Post-exec Repair failed due to API error. Cannot repair SQL. Error: %s", result.get("why", "Unknown API error"))
+            state["execution_error"] = result.get("why", "LLM API call failed. Cannot repair SQL.")
+            return state
+        
         LOGGER.info("Post-exec repair attempt %d/%d (MAX) result received", attempts + 1, MAX_INTENT_REPAIRS)
         patched_sql = result.get("patched_sql")
         raw_response = result.get("__raw")
@@ -2622,15 +3029,34 @@ def _repair_sql(llm: Any):
         
         if not patched_sql and raw_response:
             LOGGER.warning("Post-exec repair returned no patched_sql. Raw response (first 1000 chars): %s", raw_response[:1000] if len(raw_response) > 1000 else raw_response)
-        if patched_sql:
-            plan["sql"] = patched_sql
-            plan.setdefault("notes", []).append(
-                f"Applied repair iteration {attempts + 1}."
-            )
-            LOGGER.debug("Patched SQL (iteration %d): %s", attempts + 1, patched_sql)
+        
+        # Check if repair actually changed SQL
+        sql_changed = False
+        if patched_sql and patched_sql.strip():
+            # Check if SQL actually changed
+            current_sql = sql_text.strip() if sql_text else ""
+            if patched_sql.strip() != current_sql:
+                plan["sql"] = patched_sql
+                plan.setdefault("notes", []).append(
+                    f"Applied repair iteration {attempts + 1}."
+                )
+                LOGGER.debug("Patched SQL (iteration %d): %s", attempts + 1, patched_sql)
+                sql_changed = True
+            else:
+                LOGGER.warning("Post-exec repair attempt %d produced no effective change (SQL unchanged)", attempts + 1)
+        
         state["plan"] = plan
         state["repair_attempts"] = attempts + 1
-        state.pop("execution_error", None)
+        
+        # Only clear execution_error if SQL was actually changed, OR if we're continuing (not at max attempts)
+        # If repair didn't change SQL and we're at max attempts, keep execution_error so loop stops
+        if sql_changed or state["repair_attempts"] < MAX_INTENT_REPAIRS:
+            state.pop("execution_error", None)
+        else:
+            # Max attempts reached and SQL didn't change - keep execution_error to stop loop
+            if not sql_changed:
+                LOGGER.warning("Post-exec repair: Max attempts (%d) reached without SQL change. Keeping execution_error to stop loop.", MAX_INTENT_REPAIRS)
+        
         state["executions"] = []
         return state
 

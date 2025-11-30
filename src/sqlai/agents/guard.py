@@ -204,6 +204,29 @@ def validate_sql(
 ) -> Tuple[bool, List[str], str]:
     errors: List[str] = []
     patched_sql = sql
+    
+    # Check for destructive operations (CRITICAL for security and accuracy)
+    destructive_patterns = [
+        (re.compile(r'\bDROP\s+(?:TABLE|VIEW|INDEX|DATABASE|SCHEMA)\b', re.IGNORECASE), 
+         "Destructive operation detected: DROP statements are not allowed."),
+        (re.compile(r'\bTRUNCATE\s+TABLE\b', re.IGNORECASE), 
+         "Destructive operation detected: TRUNCATE statements are not allowed."),
+        (re.compile(r'\bALTER\s+TABLE\b', re.IGNORECASE), 
+         "Destructive operation detected: ALTER TABLE statements are not allowed."),
+        (re.compile(r'\bDELETE\s+FROM\s+\w+\s*(?:;|$)', re.IGNORECASE), 
+         "Destructive operation detected: DELETE without WHERE clause is not allowed."),
+        (re.compile(r'\bDELETE\s+FROM\s+\w+\s+(?!WHERE)', re.IGNORECASE), 
+         "Destructive operation detected: DELETE without WHERE clause is not allowed."),
+        (re.compile(r'\bUPDATE\s+\w+\s+SET\s+(?!.*WHERE)', re.IGNORECASE), 
+         "Destructive operation detected: UPDATE without WHERE clause is not allowed."),
+        (re.compile(r'\bINSERT\s+INTO\b', re.IGNORECASE), 
+         "Destructive operation detected: INSERT statements are not allowed."),
+    ]
+    
+    for pattern, error_msg in destructive_patterns:
+        if pattern.search(sql):
+            errors.append(error_msg)
+    
     tables = extract_tables(sql)
     known_tables = {card.name.lower() for card in graph_context.tables}
     table_card_lookup = {card.name.lower(): card for card in graph_context.tables}

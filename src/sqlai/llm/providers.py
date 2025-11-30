@@ -120,11 +120,31 @@ def _load_huggingface(config: LLMConfig) -> Any:
     - Summary: Any model (text-only or multimodal) works for text-to-text SQL generation.
       LangChain handles the format conversion automatically based on content type.
     
+    Model Name Format:
+    - HuggingFace router API supports full model names with provider suffix
+    - Example: "defog/llama-3-sqlcoder-8b:featherless-ai" (with org/prefix and :provider suffix)
+    - Pass the model name exactly as provided in config.model (keep full name including :provider)
+    
     This is different from embeddings, which use huggingface_hub.InferenceClient
     directly (see src/sqlai/embeddings/provider.py).
     """
-    provider = config.model
-    router_base_url = _resolve_hf_base_url(config.base_url, provider)
+    # Keep full model name as-is (e.g., "defog/llama-3-sqlcoder-8b:featherless-ai")
+    # HuggingFace router API supports the full format with :provider suffix
+    # IMPORTANT: Model name should include organization prefix (e.g., "defog/") if required
+    model_name = config.model
+    LOGGER.info("HuggingFace model name from config: %s", model_name)
+    
+    # Warn if model name doesn't have organization prefix (common format: "org/model:provider")
+    # Note: Previous working example: "openai/gpt-oss-safeguard-20b:groq" (has org prefix)
+    if "/" not in model_name and ":" in model_name:
+        LOGGER.warning(
+            "Model name '%s' contains ':' but no organization prefix (e.g., 'defog/'). "
+            "HuggingFace router requires full format: 'org/model:provider'. "
+            "Example: 'defog/llama-3-sqlcoder-8b:featherless-ai' (not 'llama-3-sqlcoder-8b:featherless-ai'). "
+            "Previous working format: 'openai/gpt-oss-safeguard-20b:groq'",
+            model_name,
+        )
+    router_base_url = _resolve_hf_base_url(config.base_url, model_name)
     # Always prefer the OpenAI-compatible router for chat models
     try:
         module = importlib.import_module("langchain_openai")
@@ -133,13 +153,25 @@ def _load_huggingface(config: LLMConfig) -> Any:
         raise LLMProviderError(
             "Hugging Face router support requires `langchain-openai` to be installed."
         ) from exc
-    return chat_class(
-        model=provider,
+    chat_instance = chat_class(
+        model=model_name,
         base_url=router_base_url,
         api_key=config.api_key,
         temperature=config.temperature,
         max_tokens=config.max_output_tokens,
     )
+    # Log the actual model name that will be used (check if ChatOpenAI modified it)
+    actual_model = getattr(chat_instance, "model_name", None) or getattr(chat_instance, "model", None)
+    if actual_model != model_name:
+        LOGGER.warning(
+            "Model name was modified by ChatOpenAI: input='%s', actual='%s'. "
+            "This may cause API errors. Consider using the exact model name format expected by HuggingFace router.",
+            model_name,
+            actual_model,
+        )
+    else:
+        LOGGER.debug("Model name passed correctly to ChatOpenAI: %s", model_name)
+    return chat_instance
 
 
 def _resolve_hf_base_url(base_url: str | None, model: str) -> str:

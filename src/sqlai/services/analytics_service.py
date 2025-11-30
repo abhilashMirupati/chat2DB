@@ -32,6 +32,7 @@ from sqlai.config import (
     load_database_config,
     load_embedding_config,
     load_llm_config,
+    load_limits_config,
     load_vector_store_config,
 )
 from sqlai.database.connectors import build_sql_database, create_db_engine, test_connection
@@ -84,6 +85,7 @@ class AnalyticsService:
         )
         self.vector_config = load_vector_store_config()
         self.app_config = load_app_config()
+        self.limits_config = load_limits_config()
         self.graph_cache = GraphCache(self.app_config.cache_dir / "graph_cards.db")
         self._validate_runtime_requirements()
         self.vector_store = VectorStoreManager(
@@ -263,8 +265,8 @@ class AnalyticsService:
             self._sync_graph_cache_and_vectors()
         self.row_cap = self.db_config.sample_row_limit
 
-        # Get max repair iterations from app config (already loaded in __init__)
-        self.workflow = create_query_workflow(self.llm, self.engine, max_repair_iterations=self.app_config.max_repair_iterations)
+        # Get max repair iterations from limits config
+        self.workflow = create_query_workflow(self.llm, self.engine, max_repair_iterations=self.limits_config.max_repair_iterations)
         self.sql_database = build_sql_database(self.engine, self.db_config)
         self.conversation: List[Dict[str, Any]] = []
 
@@ -331,7 +333,7 @@ class AnalyticsService:
         schema_key = self._schema_key() or "(default)"
         
         # Get recent questions from cache
-        recent_queries = self.conversation_cache.get_recent_questions(schema_key, limit=20)
+        recent_queries = self.conversation_cache.get_recent_questions(schema_key, limit=self.limits_config.recent_queries_limit)
         if not recent_queries:
             return None
         
@@ -485,7 +487,7 @@ class AnalyticsService:
 
         # Step 1: Check for similar questions (unless skipped)
         if not skip_similarity_check:
-            similar = self._check_similar_questions(question, similarity_threshold=0.75)
+            similar = self._check_similar_questions(question, similarity_threshold=self.limits_config.similarity_threshold_similar_questions)
             if similar:
                 # Step 2: Use LLM to verify intent is the same
                 intent_check = self._check_intent_same(
@@ -533,8 +535,10 @@ class AnalyticsService:
         retrieval = self.semantic_retriever.select_cards(
             graph=self.graph_context,
             question=question,
-            fk_expansion_max_depth=self.app_config.fk_expansion_max_depth,
-            fk_expansion_max_tables=self.app_config.fk_expansion_max_tables,
+            max_tables=self.limits_config.max_tables,
+            max_columns=self.limits_config.max_columns,
+            fk_expansion_max_depth=self.limits_config.fk_expansion_max_depth,
+            fk_expansion_max_tables=self.limits_config.fk_expansion_max_tables,
             table_filter=table_filter,  # Pass table filter to limit vector search
         )
         LOGGER.debug("Retrieval details: %s", retrieval.details)
@@ -609,10 +613,14 @@ class AnalyticsService:
         LOGGER.debug("Executing ad-hoc SQL: %s", sql)
         return pd.read_sql_query(sql, self.engine)
 
-    def get_conversation(self, limit: int = 10) -> List[Dict[str, Any]]:
+    def get_conversation(self, limit: int | None = None) -> List[Dict[str, Any]]:
+        if limit is None:
+            limit = self.limits_config.conversation_limit
         return self.conversation[-limit:]
 
-    def list_saved_queries(self, limit: int = 20) -> List[Dict[str, Any]]:
+    def list_saved_queries(self, limit: int | None = None) -> List[Dict[str, Any]]:
+        if limit is None:
+            limit = self.limits_config.recent_queries_limit
         schema_key = self._schema_key() or "(default)"
         return self.conversation_cache.list_interactions(schema_key, limit=limit)
 
@@ -2146,7 +2154,7 @@ class AnalyticsService:
         column_samples: Dict[str, Dict[str, List[str]]] = {}
         for table_card in tables[:2]:
             qualified_table = self._qualify_table(table_card.name)
-            query = self._sample_query(qualified_table, limit=3)
+            query = self._sample_query(qualified_table, limit=self.limits_config.sample_query_limit)
             try:
                 sample_df = pd.read_sql_query(query, self.engine)
             except Exception as exc:  # noqa: BLE001
